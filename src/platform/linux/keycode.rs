@@ -47,6 +47,7 @@ pub fn rdev_key_to_key(key: rdev::Key) -> Option<Key> {
         RK::Num9 => Some(Key::Num9),
 
         // Function keys
+        // Note: rdev on Linux only supports F1-F12
         RK::F1 => Some(Key::F1),
         RK::F2 => Some(Key::F2),
         RK::F3 => Some(Key::F3),
@@ -59,14 +60,6 @@ pub fn rdev_key_to_key(key: rdev::Key) -> Option<Key> {
         RK::F10 => Some(Key::F10),
         RK::F11 => Some(Key::F11),
         RK::F12 => Some(Key::F12),
-        RK::F13 => Some(Key::F13),
-        RK::F14 => Some(Key::F14),
-        RK::F15 => Some(Key::F15),
-        RK::F16 => Some(Key::F16),
-        RK::F17 => Some(Key::F17),
-        RK::F18 => Some(Key::F18),
-        RK::F19 => Some(Key::F19),
-        RK::F20 => Some(Key::F20),
 
         // Special keys
         RK::Space => Some(Key::Space),
