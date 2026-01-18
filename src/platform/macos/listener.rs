@@ -9,7 +9,7 @@ use std::thread::{self, JoinHandle};
 
 use objc2_core_foundation::{CFMachPort, CFRetained, CFRunLoop, CFRunLoopSource};
 use objc2_core_graphics::{
-    CGEvent, CGEventField, CGEventMask, CGEventTapCallBack, CGEventTapLocation,
+    CGEvent, CGEventField, CGEventFlags, CGEventMask, CGEventTapCallBack, CGEventTapLocation,
     CGEventTapOptions, CGEventTapPlacement, CGEventTapProxy, CGEventType,
 };
 
@@ -131,11 +131,30 @@ unsafe extern "C-unwind" fn event_tap_callback(
                         as u16;
                 let changed_modifier = keycode_to_modifier(keycode);
 
+                // Check if this is a lock key (e.g., Caps Lock) which comes through
+                // as FlagsChanged but isn't a traditional modifier
+                let lock_key = keycode_to_key(keycode);
+
                 let prev_mods = state.current_modifiers;
                 state.current_modifiers = modifiers;
 
-                // Only emit if modifiers actually changed
-                if modifiers != prev_mods {
+                // Handle lock keys specially - they come through FlagsChanged
+                // but don't change our tracked modifier state
+                if let Some(key) = lock_key {
+                    // For lock keys, we need to track press/release via the alpha lock flag
+                    // or just emit both down and up on each press
+                    let is_key_down = flags.contains(CGEventFlags::MaskAlphaShift);
+
+                    should_block = state.should_block(modifiers, Some(key));
+
+                    let _ = state.event_sender.send(KeyEvent {
+                        modifiers,
+                        key: Some(key),
+                        is_key_down,
+                        changed_modifier: None,
+                    });
+                } else if modifiers != prev_mods {
+                    // Regular modifier key - only emit if modifiers actually changed
                     // Determine press vs release by checking which bits changed
                     let gained = modifiers.bits() & !prev_mods.bits();
                     // A key is down if we gained any modifier bits

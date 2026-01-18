@@ -12,8 +12,13 @@ mod vk {
     pub const SHIFT: u16 = 0x10;
     pub const CONTROL: u16 = 0x11;
     pub const MENU: u16 = 0x12; // Alt
+    pub const CAPITAL: u16 = 0x14; // Caps Lock
     pub const ESCAPE: u16 = 0x1B;
     pub const SPACE: u16 = 0x20;
+
+    // Lock keys
+    pub const NUMLOCK: u16 = 0x90;
+    pub const SCROLL: u16 = 0x91;
 
     // Navigation keys
     pub const PRIOR: u16 = 0x21; // Page Up
@@ -209,6 +214,11 @@ pub fn vk_to_key(vk_code: u16, is_extended: bool) -> Option<Key> {
         vk::OEM_5 => Some(Key::Backslash),
         vk::OEM_6 => Some(Key::RightBracket),
         vk::OEM_7 => Some(Key::Quote),
+
+        // Lock keys
+        vk::CAPITAL => Some(Key::CapsLock),
+        vk::NUMLOCK => Some(Key::NumLock),
+        vk::SCROLL => Some(Key::ScrollLock),
 
         _ => None,
     }

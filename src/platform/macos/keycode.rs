@@ -220,6 +220,7 @@ pub fn keycode_to_key(keycode: CGKeyCode) -> Option<Key> {
         keycodes::KEYPAD_ENTER => Some(Key::KeypadEnter),
         keycodes::KEYPAD_MINUS => Some(Key::KeypadMinus),
         keycodes::KEYPAD_EQUALS => Some(Key::KeypadEquals),
+        keycodes::CAPS_LOCK => Some(Key::CapsLock),
         _ => None,
     }
 }

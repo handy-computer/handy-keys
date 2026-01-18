@@ -64,6 +64,11 @@ pub enum Key {
     KeypadEnter,
     KeypadMinus,
     KeypadEquals,
+
+    // Lock keys
+    CapsLock,
+    ScrollLock,
+    NumLock,
 }
 
 impl fmt::Display for Key {
@@ -168,6 +173,9 @@ impl fmt::Display for Key {
             Key::KeypadEnter => write!(f, "KeypadEnter"),
             Key::KeypadMinus => write!(f, "Keypad-"),
             Key::KeypadEquals => write!(f, "Keypad="),
+            Key::CapsLock => write!(f, "CapsLock"),
+            Key::ScrollLock => write!(f, "ScrollLock"),
+            Key::NumLock => write!(f, "NumLock"),
         }
     }
 }
@@ -291,6 +299,11 @@ impl FromStr for Key {
             "keypadenter" => Ok(Key::KeypadEnter),
             "keypad-" | "keypadminus" => Ok(Key::KeypadMinus),
             "keypad=" | "keypadequals" => Ok(Key::KeypadEquals),
+
+            // Lock keys
+            "capslock" | "caps" => Ok(Key::CapsLock),
+            "scrolllock" | "scroll" => Ok(Key::ScrollLock),
+            "numlock" => Ok(Key::NumLock),
 
             _ => Err(Error::UnknownKey(s.to_string())),
         }

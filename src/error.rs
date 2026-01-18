@@ -3,6 +3,9 @@ use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum Error {
+    #[error("IO error: {0}")]
+    Io(#[from] std::io::Error),
+
     #[error("Accessibility permission not granted. Please enable it in System Settings > Privacy & Security > Accessibility")]
     AccessibilityNotGranted,
 

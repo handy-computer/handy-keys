@@ -110,6 +110,11 @@ pub fn rdev_key_to_key(key: rdev::Key) -> Option<Key> {
         RK::KpDelete => Some(Key::KeypadDecimal),
         RK::KpReturn => Some(Key::KeypadEnter),
 
+        // Lock keys
+        RK::CapsLock => Some(Key::CapsLock),
+        RK::ScrollLock => Some(Key::ScrollLock),
+        RK::NumLock => Some(Key::NumLock),
+
         _ => None,
     }
 }
