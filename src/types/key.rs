@@ -1,4 +1,4 @@
-//! Keyboard key definitions and parsing
+//! Keyboard key and mouse button definitions and parsing
 
 use serde::{Deserialize, Serialize};
 use std::fmt;
@@ -6,7 +6,7 @@ use std::str::FromStr;
 
 use crate::error::{Error, Result};
 
-/// Keyboard keys that can be used in hotkey combinations
+/// Keyboard keys and mouse buttons that can be used in hotkey combinations
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[non_exhaustive]
 pub enum Key {
@@ -69,6 +69,15 @@ pub enum Key {
     CapsLock,
     ScrollLock,
     NumLock,
+
+    // Mouse buttons
+    MouseLeft,
+    MouseRight,
+    MouseMiddle,
+    /// Extra button 1 (often "back" on mice with side buttons)
+    MouseX1,
+    /// Extra button 2 (often "forward" on mice with side buttons)
+    MouseX2,
 }
 
 impl fmt::Display for Key {
@@ -176,6 +185,11 @@ impl fmt::Display for Key {
             Key::CapsLock => write!(f, "CapsLock"),
             Key::ScrollLock => write!(f, "ScrollLock"),
             Key::NumLock => write!(f, "NumLock"),
+            Key::MouseLeft => write!(f, "MouseLeft"),
+            Key::MouseRight => write!(f, "MouseRight"),
+            Key::MouseMiddle => write!(f, "MouseMiddle"),
+            Key::MouseX1 => write!(f, "MouseX1"),
+            Key::MouseX2 => write!(f, "MouseX2"),
         }
     }
 }
@@ -304,6 +318,13 @@ impl FromStr for Key {
             "capslock" | "caps" => Ok(Key::CapsLock),
             "scrolllock" | "scroll" => Ok(Key::ScrollLock),
             "numlock" => Ok(Key::NumLock),
+
+            // Mouse buttons
+            "mouseleft" | "leftclick" | "lmb" | "mouse1" => Ok(Key::MouseLeft),
+            "mouseright" | "rightclick" | "rmb" | "mouse2" => Ok(Key::MouseRight),
+            "mousemiddle" | "middleclick" | "mmb" | "mouse3" => Ok(Key::MouseMiddle),
+            "mousex1" | "mouse4" | "back" | "xbutton1" => Ok(Key::MouseX1),
+            "mousex2" | "mouse5" | "forward" | "xbutton2" => Ok(Key::MouseX2),
 
             _ => Err(Error::UnknownKey(s.to_string())),
         }

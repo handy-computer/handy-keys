@@ -131,6 +131,19 @@ pub fn rdev_key_to_modifier(key: rdev::Key) -> Option<Modifiers> {
     }
 }
 
+/// Convert rdev::Button to our Key type
+pub fn rdev_button_to_key(button: rdev::Button) -> Option<Key> {
+    use rdev::Button as RB;
+    match button {
+        RB::Left => Some(Key::MouseLeft),
+        RB::Right => Some(Key::MouseRight),
+        RB::Middle => Some(Key::MouseMiddle),
+        RB::Unknown(8) => Some(Key::MouseX1), // Back button (X11 button 8)
+        RB::Unknown(9) => Some(Key::MouseX2), // Forward button (X11 button 9)
+        _ => None,
+    }
+}
+
 /// Update modifier state based on key event
 pub fn update_modifiers(current: Modifiers, key: rdev::Key, pressed: bool) -> Modifiers {
     use rdev::Key as RK;

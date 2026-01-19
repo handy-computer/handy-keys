@@ -15,7 +15,8 @@ use crate::error::Result;
 use crate::platform::state::{BlockingHotkeys, ListenerState};
 use crate::types::{KeyEvent, Modifiers};
 
-use super::keycode::{rdev_key_to_key, rdev_key_to_modifier, update_modifiers};
+use super::keycode::{rdev_button_to_key, rdev_key_to_key, rdev_key_to_modifier, update_modifiers};
+use crate::types::Key;
 
 /// Internal listener state returned to KeyboardListener
 pub(crate) struct LinuxListenerState {
@@ -100,6 +101,33 @@ pub(crate) fn spawn(blocking_hotkeys: Option<BlockingHotkeys>) -> Result<LinuxLi
                                 is_key_down: false,
                                 changed_modifier: None,
                             });
+                        }
+                    }
+                    rdev::EventType::ButtonPress(button) => {
+                        if let Some(key) = rdev_button_to_key(button) {
+                            // Only report left/right clicks when modifiers are held
+                            let is_common = matches!(key, Key::MouseLeft | Key::MouseRight);
+                            if !is_common || !state.current_modifiers.is_empty() {
+                                let _ = state.event_sender.send(KeyEvent {
+                                    modifiers: state.current_modifiers,
+                                    key: Some(key),
+                                    is_key_down: true,
+                                    changed_modifier: None,
+                                });
+                            }
+                        }
+                    }
+                    rdev::EventType::ButtonRelease(button) => {
+                        if let Some(key) = rdev_button_to_key(button) {
+                            let is_common = matches!(key, Key::MouseLeft | Key::MouseRight);
+                            if !is_common || !state.current_modifiers.is_empty() {
+                                let _ = state.event_sender.send(KeyEvent {
+                                    modifiers: state.current_modifiers,
+                                    key: Some(key),
+                                    is_key_down: false,
+                                    changed_modifier: None,
+                                });
+                            }
                         }
                     }
                     _ => {}

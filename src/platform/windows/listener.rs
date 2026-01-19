@@ -8,8 +8,10 @@ use std::thread::{self, JoinHandle};
 use windows::Win32::Foundation::{LPARAM, LRESULT, WPARAM};
 use windows::Win32::UI::WindowsAndMessaging::{
     CallNextHookEx, DispatchMessageW, PeekMessageW, SetWindowsHookExW, TranslateMessage,
-    UnhookWindowsHookEx, KBDLLHOOKSTRUCT, LLKHF_EXTENDED, MSG, PM_REMOVE, WH_KEYBOARD_LL,
-    WM_KEYDOWN, WM_KEYUP, WM_QUIT, WM_SYSKEYDOWN, WM_SYSKEYUP,
+    UnhookWindowsHookEx, KBDLLHOOKSTRUCT, LLKHF_EXTENDED, MSLLHOOKSTRUCT, MSG, PM_REMOVE,
+    WH_KEYBOARD_LL, WH_MOUSE_LL, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN, WM_LBUTTONUP,
+    WM_MBUTTONDOWN, WM_MBUTTONUP, WM_QUIT, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SYSKEYDOWN,
+    WM_SYSKEYUP, WM_XBUTTONDOWN, WM_XBUTTONUP,
 };
 
 use crate::error::Result;
@@ -58,12 +60,25 @@ pub(crate) fn spawn(blocking_hotkeys: Option<BlockingHotkeys>) -> Result<Windows
         });
 
         // Install the low-level keyboard hook
-        let hook = unsafe { SetWindowsHookExW(WH_KEYBOARD_LL, Some(keyboard_hook_proc), None, 0) };
+        let kb_hook = unsafe { SetWindowsHookExW(WH_KEYBOARD_LL, Some(keyboard_hook_proc), None, 0) };
 
-        let hook = match hook {
+        let kb_hook = match kb_hook {
             Ok(h) => h,
             Err(e) => {
                 eprintln!("Failed to install keyboard hook: {:?}", e);
+                return;
+            }
+        };
+
+        // Install the low-level mouse hook
+        let mouse_hook = unsafe { SetWindowsHookExW(WH_MOUSE_LL, Some(mouse_hook_proc), None, 0) };
+
+        let mouse_hook = match mouse_hook {
+            Ok(h) => h,
+            Err(e) => {
+                eprintln!("Failed to install mouse hook: {:?}", e);
+                // Clean up keyboard hook before returning
+                unsafe { let _ = UnhookWindowsHookEx(kb_hook); }
                 return;
             }
         };
@@ -92,9 +107,10 @@ pub(crate) fn spawn(blocking_hotkeys: Option<BlockingHotkeys>) -> Result<Windows
             thread::sleep(std::time::Duration::from_millis(10));
         }
 
-        // Clean up the hook
+        // Clean up the hooks
         unsafe {
-            let _ = UnhookWindowsHookEx(hook);
+            let _ = UnhookWindowsHookEx(kb_hook);
+            let _ = UnhookWindowsHookEx(mouse_hook);
         }
 
         // Clear thread-local state
@@ -190,6 +206,77 @@ unsafe extern "system" fn keyboard_hook_proc(
         // Pass to next hook in chain
         CallNextHookEx(None, code, wparam, lparam)
     }
+}
+
+/// Low-level mouse hook callback
+///
+/// This function is called by Windows for every mouse event system-wide.
+unsafe extern "system" fn mouse_hook_proc(
+    code: i32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    // If code < 0, we must pass to next hook without processing
+    if code < 0 {
+        return CallNextHookEx(None, code, wparam, lparam);
+    }
+
+    // Process the mouse event
+    HOOK_CONTEXT.with(|ctx_cell| {
+        let mut ctx_ref = ctx_cell.borrow_mut();
+        if let Some(ctx) = ctx_ref.as_mut() {
+            let mouse_struct = &*(lparam.0 as *const MSLLHOOKSTRUCT);
+
+            // Only report left/right clicks when modifiers are held (to avoid noise)
+            let has_modifiers = !ctx.current_modifiers.is_empty();
+
+            let (key, is_down) = match wparam.0 as u32 {
+                WM_LBUTTONDOWN if has_modifiers => (Some(Key::MouseLeft), true),
+                WM_LBUTTONUP if has_modifiers => (Some(Key::MouseLeft), false),
+                WM_RBUTTONDOWN if has_modifiers => (Some(Key::MouseRight), true),
+                WM_RBUTTONUP if has_modifiers => (Some(Key::MouseRight), false),
+                // Middle and X buttons always reported
+                WM_MBUTTONDOWN => (Some(Key::MouseMiddle), true),
+                WM_MBUTTONUP => (Some(Key::MouseMiddle), false),
+                WM_XBUTTONDOWN => {
+                    // High word of mouseData contains which X button (1 or 2)
+                    let xbutton = (mouse_struct.mouseData >> 16) & 0xFFFF;
+                    let key = if xbutton == 1 {
+                        Some(Key::MouseX1)
+                    } else if xbutton == 2 {
+                        Some(Key::MouseX2)
+                    } else {
+                        None
+                    };
+                    (key, true)
+                }
+                WM_XBUTTONUP => {
+                    let xbutton = (mouse_struct.mouseData >> 16) & 0xFFFF;
+                    let key = if xbutton == 1 {
+                        Some(Key::MouseX1)
+                    } else if xbutton == 2 {
+                        Some(Key::MouseX2)
+                    } else {
+                        None
+                    };
+                    (key, false)
+                }
+                _ => (None, false),
+            };
+
+            if let Some(key) = key {
+                let _ = ctx.event_sender.send(KeyEvent {
+                    modifiers: ctx.current_modifiers,
+                    key: Some(key),
+                    is_key_down: is_down,
+                    changed_modifier: None,
+                });
+            }
+        }
+    });
+
+    // Always pass mouse events through (no blocking for mouse)
+    CallNextHookEx(None, code, wparam, lparam)
 }
 
 /// Check if a hotkey combination should be blocked

@@ -15,7 +15,7 @@ use objc2_core_graphics::{
 
 use crate::error::{Error, Result};
 use crate::platform::state::{BlockingHotkeys, ListenerState};
-use crate::types::KeyEvent;
+use crate::types::{Key, KeyEvent};
 
 use super::keycode::{flags_to_modifiers, keycode_to_key, keycode_to_modifier};
 use super::permissions::check_accessibility;
@@ -187,6 +187,81 @@ unsafe extern "C-unwind" fn event_tap_callback(
                     });
                 }
             }
+            // Mouse button events
+            // Only report left/right clicks when modifiers are held (to avoid noise)
+            CGEventType::LeftMouseDown if !modifiers.is_empty() => {
+                let _ = state.event_sender.send(KeyEvent {
+                    modifiers,
+                    key: Some(Key::MouseLeft),
+                    is_key_down: true,
+                    changed_modifier: None,
+                });
+            }
+            CGEventType::LeftMouseUp if !modifiers.is_empty() => {
+                let _ = state.event_sender.send(KeyEvent {
+                    modifiers,
+                    key: Some(Key::MouseLeft),
+                    is_key_down: false,
+                    changed_modifier: None,
+                });
+            }
+            CGEventType::RightMouseDown if !modifiers.is_empty() => {
+                let _ = state.event_sender.send(KeyEvent {
+                    modifiers,
+                    key: Some(Key::MouseRight),
+                    is_key_down: true,
+                    changed_modifier: None,
+                });
+            }
+            CGEventType::RightMouseUp if !modifiers.is_empty() => {
+                let _ = state.event_sender.send(KeyEvent {
+                    modifiers,
+                    key: Some(Key::MouseRight),
+                    is_key_down: false,
+                    changed_modifier: None,
+                });
+            }
+            // Pass through unmodified left/right clicks
+            CGEventType::LeftMouseDown
+            | CGEventType::LeftMouseUp
+            | CGEventType::RightMouseDown
+            | CGEventType::RightMouseUp => {}
+            CGEventType::OtherMouseDown => {
+                let button_number =
+                    CGEvent::integer_value_field(Some(cg_event), CGEventField::MouseEventButtonNumber);
+                let key = match button_number {
+                    2 => Some(Key::MouseMiddle),
+                    3 => Some(Key::MouseX1),
+                    4 => Some(Key::MouseX2),
+                    _ => None, // Unknown button
+                };
+                if let Some(key) = key {
+                    let _ = state.event_sender.send(KeyEvent {
+                        modifiers,
+                        key: Some(key),
+                        is_key_down: true,
+                        changed_modifier: None,
+                    });
+                }
+            }
+            CGEventType::OtherMouseUp => {
+                let button_number =
+                    CGEvent::integer_value_field(Some(cg_event), CGEventField::MouseEventButtonNumber);
+                let key = match button_number {
+                    2 => Some(Key::MouseMiddle),
+                    3 => Some(Key::MouseX1),
+                    4 => Some(Key::MouseX2),
+                    _ => None,
+                };
+                if let Some(key) = key {
+                    let _ = state.event_sender.send(KeyEvent {
+                        modifiers,
+                        key: Some(key),
+                        is_key_down: false,
+                        changed_modifier: None,
+                    });
+                }
+            }
             _ => {}
         }
     }
@@ -209,7 +284,14 @@ fn run_event_tap(
     // Event types we want to monitor
     let event_mask: CGEventMask = (1 << CGEventType::KeyDown.0)
         | (1 << CGEventType::KeyUp.0)
-        | (1 << CGEventType::FlagsChanged.0);
+        | (1 << CGEventType::FlagsChanged.0)
+        // Mouse buttons
+        | (1 << CGEventType::LeftMouseDown.0)
+        | (1 << CGEventType::LeftMouseUp.0)
+        | (1 << CGEventType::RightMouseDown.0)
+        | (1 << CGEventType::RightMouseUp.0)
+        | (1 << CGEventType::OtherMouseDown.0)
+        | (1 << CGEventType::OtherMouseUp.0);
 
     // Store state in a raw pointer for the callback
     let state_ptr = Arc::into_raw(Arc::clone(&state)) as *mut c_void;
