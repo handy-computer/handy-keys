@@ -98,6 +98,14 @@ unsafe extern "C-unwind" fn event_tap_callback(
 
                 let key = keycode_to_key(keycode);
 
+                // Skip special function key events (e.g., F3 triggering Mission Control).
+                // These have MaskSecondaryFn set but use special keycodes (like 0xA0)
+                // that we don't recognize. Without this check, they'd be reported as
+                // "Fn pressed" with no key.
+                if key.is_none() && flags.contains(CGEventFlags::MaskSecondaryFn) {
+                    return event.as_ptr();
+                }
+
                 // Check if this should be blocked
                 should_block = state.should_block(modifiers, key);
 
@@ -115,6 +123,11 @@ unsafe extern "C-unwind" fn event_tap_callback(
 
                 let key = keycode_to_key(keycode);
 
+                // Skip special function key events (same as KeyDown)
+                if key.is_none() && flags.contains(CGEventFlags::MaskSecondaryFn) {
+                    return event.as_ptr();
+                }
+
                 // Block key up if we blocked key down (to be consistent)
                 should_block = state.should_block(modifiers, key);
 
@@ -129,6 +142,7 @@ unsafe extern "C-unwind" fn event_tap_callback(
                 let keycode =
                     CGEvent::integer_value_field(Some(cg_event), CGEventField::KeyboardEventKeycode)
                         as u16;
+
                 let changed_modifier = keycode_to_modifier(keycode);
 
                 // Check if this is a lock key (e.g., Caps Lock) which comes through
