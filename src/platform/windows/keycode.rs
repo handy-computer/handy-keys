@@ -147,6 +147,12 @@ pub fn vk_to_key(vk_code: u16, is_extended: bool) -> Option<Key> {
         0x38 => Some(Key::Num8),
         0x39 => Some(Key::Num9),
 
+        // Media keys
+        0xB3 => Some(Key::PlayPause),
+        0xB2 => Some(Key::Stop),
+        0xB1 => Some(Key::PrevTrack),
+        0xB0 => Some(Key::NextTrack),
+
         // Numpad keys - these are always distinct from main keys
         vk::NUMPAD0 => Some(Key::Keypad0),
         vk::NUMPAD1 => Some(Key::Keypad1),

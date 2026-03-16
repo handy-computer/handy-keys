@@ -50,6 +50,12 @@ pub enum Key {
     Num8,
     Num9,
 
+    // Media keys
+    PlayPause,
+    Stop,
+    PrevTrack,
+    NextTrack,
+
     // Function keys
     F1,
     F2,
@@ -185,6 +191,10 @@ impl fmt::Display for Key {
             Key::Num7 => write!(f, "7"),
             Key::Num8 => write!(f, "8"),
             Key::Num9 => write!(f, "9"),
+            Key::PlayPause => write!(f, "PlayPause"),
+            Key::Stop => write!(f, "Stop"),
+            Key::PrevTrack => write!(f, "PrevTrack"),
+            Key::NextTrack => write!(f, "NextTrack"),
             Key::F1 => write!(f, "F1"),
             Key::F2 => write!(f, "F2"),
             Key::F3 => write!(f, "F3"),
@@ -313,6 +323,12 @@ impl FromStr for Key {
             "7" | "num7" => Ok(Key::Num7),
             "8" | "num8" => Ok(Key::Num8),
             "9" | "num9" => Ok(Key::Num9),
+
+            // Media keys
+            "playpause" => Ok(Key::PlayPause),
+            "stop" => Ok(Key::Stop),
+            "prevtrack" => Ok(Key::PrevTrack),
+            "nexttrack" => Ok(Key::NextTrack),
 
             // Function keys
             "f1" => Ok(Key::F1),
