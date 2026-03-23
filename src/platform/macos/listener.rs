@@ -158,6 +158,17 @@ unsafe extern "C-unwind" fn event_tap_callback(
                     return event.as_ptr();
                 }
 
+                // On macOS, strip FN from function key events (F1-F20). The fn key
+                // is required to access F-keys when the keyboard is in default "media
+                // keys" mode, but it's a transport mechanism — not a meaningful
+                // modifier. Stripping it ensures that a hotkey registered as "f5"
+                // matches regardless of the user's keyboard configuration.
+                let modifiers = if key.map_or(false, |k| k.is_function_key()) {
+                    modifiers & !Modifiers::FN
+                } else {
+                    modifiers
+                };
+
                 // Check if this should be blocked
                 should_block = state.should_block(modifiers, key);
 
@@ -180,6 +191,13 @@ unsafe extern "C-unwind" fn event_tap_callback(
                 if key.is_none() && flags_have_fn(flags) {
                     return event.as_ptr();
                 }
+
+                // Strip FN from function key events (same rationale as KeyDown)
+                let modifiers = if key.map_or(false, |k| k.is_function_key()) {
+                    modifiers & !Modifiers::FN
+                } else {
+                    modifiers
+                };
 
                 // Block key up if we blocked key down (to be consistent)
                 should_block = state.should_block(modifiers, key);

@@ -146,6 +146,42 @@ pub enum Key {
     MouseX2,
 }
 
+impl Key {
+    /// Returns `true` if this key is a function key (F1–F20).
+    ///
+    /// On macOS, function keys require holding `fn` when the keyboard is in
+    /// default "media keys" mode. The `fn` key sets the `FN` modifier flag,
+    /// but it acts as a transport mechanism — not a meaningful modifier.
+    /// This helper is used to strip FN from function key events so that a
+    /// hotkey registered as `"f5"` matches regardless of the user's keyboard
+    /// configuration.
+    pub fn is_function_key(self) -> bool {
+        matches!(
+            self,
+            Key::F1
+                | Key::F2
+                | Key::F3
+                | Key::F4
+                | Key::F5
+                | Key::F6
+                | Key::F7
+                | Key::F8
+                | Key::F9
+                | Key::F10
+                | Key::F11
+                | Key::F12
+                | Key::F13
+                | Key::F14
+                | Key::F15
+                | Key::F16
+                | Key::F17
+                | Key::F18
+                | Key::F19
+                | Key::F20
+        )
+    }
+}
+
 impl fmt::Display for Key {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -509,5 +545,21 @@ mod tests {
             let parsed: Key = displayed.parse().unwrap();
             assert_eq!(parsed, key, "Roundtrip failed for {:?}", key);
         }
+    }
+
+    #[test]
+    fn is_function_key() {
+        // F1-F20 are function keys
+        assert!(Key::F1.is_function_key());
+        assert!(Key::F5.is_function_key());
+        assert!(Key::F12.is_function_key());
+        assert!(Key::F20.is_function_key());
+
+        // Everything else is not
+        assert!(!Key::A.is_function_key());
+        assert!(!Key::Space.is_function_key());
+        assert!(!Key::Num5.is_function_key());
+        assert!(!Key::Escape.is_function_key());
+        assert!(!Key::MouseLeft.is_function_key());
     }
 }
