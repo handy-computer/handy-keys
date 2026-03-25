@@ -123,6 +123,7 @@ mod keycodes {
     pub const RIGHT_ARROW: u16 = 0x7C;
     pub const DOWN_ARROW: u16 = 0x7D;
     pub const UP_ARROW: u16 = 0x7E;
+    pub const VOICE: u16 = 0xB0;
 }
 
 /// Convert a macOS virtual keycode to a Key enum
@@ -184,6 +185,7 @@ pub fn keycode_to_key(keycode: CGKeyCode) -> Option<Key> {
         keycodes::F18 => Some(Key::F18),
         keycodes::F19 => Some(Key::F19),
         keycodes::F20 => Some(Key::F20),
+        keycodes::VOICE => Some(Key::Voice),
         keycodes::SPACE => Some(Key::Space),
         keycodes::RETURN => Some(Key::Return),
         keycodes::TAB => Some(Key::Tab),

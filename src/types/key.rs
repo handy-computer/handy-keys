@@ -72,6 +72,9 @@ pub enum Key {
     F19,
     F20,
 
+    // Media keys
+    Voice,
+
     // Special keys
     Space,
     Return,
@@ -205,6 +208,7 @@ impl fmt::Display for Key {
             Key::F18 => write!(f, "F18"),
             Key::F19 => write!(f, "F19"),
             Key::F20 => write!(f, "F20"),
+            Key::Voice => write!(f, "Voice"),
             Key::Space => write!(f, "Space"),
             Key::Return => write!(f, "Return"),
             Key::Tab => write!(f, "Tab"),
@@ -335,6 +339,9 @@ impl FromStr for Key {
             "f18" => Ok(Key::F18),
             "f19" => Ok(Key::F19),
             "f20" => Ok(Key::F20),
+
+            // Media keys
+            "voice" => Ok(Key::Voice),
 
             // Special keys
             "space" | " " => Ok(Key::Space),
