@@ -5,13 +5,19 @@ use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 
-use windows::Win32::Foundation::{LPARAM, LRESULT, WPARAM};
+use std::ptr;
+
+use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
+use windows::Win32::System::RemoteDesktop::{
+    WTSRegisterSessionNotification, WTSUnRegisterSessionNotification,
+};
 use windows::Win32::UI::WindowsAndMessaging::{
-    CallNextHookEx, DispatchMessageW, MsgWaitForMultipleObjects, PeekMessageW, SetWindowsHookExW,
-    TranslateMessage, UnhookWindowsHookEx, KBDLLHOOKSTRUCT, LLKHF_EXTENDED, MSG, MSLLHOOKSTRUCT,
-    PM_REMOVE, QS_ALLINPUT, WH_KEYBOARD_LL, WH_MOUSE_LL, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN,
-    WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_QUIT, WM_RBUTTONDOWN, WM_RBUTTONUP,
-    WM_SYSKEYDOWN, WM_SYSKEYUP, WM_XBUTTONDOWN, WM_XBUTTONUP,
+    CallNextHookEx, CreateWindowExW, DestroyWindow, DispatchMessageW, MsgWaitForMultipleObjects,
+    PeekMessageW, RegisterClassW, SetWindowsHookExW, TranslateMessage, UnhookWindowsHookEx,
+    HWND_MESSAGE, KBDLLHOOKSTRUCT, LLKHF_EXTENDED, MSG, MSLLHOOKSTRUCT, PM_REMOVE, QS_ALLINPUT,
+    WH_KEYBOARD_LL, WH_MOUSE_LL, WINDOW_EX_STYLE, WINDOW_STYLE, WM_KEYDOWN, WM_KEYUP,
+    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_QUIT, WM_RBUTTONDOWN,
+    WM_RBUTTONUP, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_XBUTTONDOWN, WM_XBUTTONUP, WNDCLASSW,
 };
 
 use crate::error::Result;
@@ -21,6 +27,11 @@ use crate::types::{Hotkey, Key, KeyEvent, Modifiers};
 use super::keycode::{vk_to_key, vk_to_modifier};
 
 const HOOK_LOOP_TIMEOUT_MS: u32 = 10;
+
+// WTS constants not in the windows crate's generated bindings
+const NOTIFY_FOR_THIS_SESSION: u32 = 0;
+const WM_WTSSESSION_CHANGE: u32 = 0x02B1;
+const WTS_SESSION_UNLOCK: usize = 0x8;
 
 /// Thread-local state for the keyboard hook callback.
 ///
@@ -36,24 +47,112 @@ thread_local! {
     static HOOK_CONTEXT: std::cell::RefCell<Option<HookContext>> = const { std::cell::RefCell::new(None) };
 }
 
-/// Drain all pending thread messages and return `true` if WM_QUIT was received.
-fn drain_thread_messages(msg: &mut MSG) -> bool {
+/// Result of draining the thread message queue.
+enum DrainResult {
+    /// Normal -- all messages processed, loop continues.
+    Continue,
+    /// WM_QUIT received -- exit the message loop.
+    Quit,
+    /// Windows session was unlocked -- hooks need re-installation.
+    SessionUnlock,
+}
+
+/// Drain all pending thread messages.
+fn drain_thread_messages(msg: &mut MSG) -> DrainResult {
+    let mut session_unlocked = false;
     unsafe {
         while PeekMessageW(msg, None, 0, 0, PM_REMOVE).as_bool() {
             if msg.message == WM_QUIT {
-                return true;
+                return DrainResult::Quit;
+            }
+            if msg.message == WM_WTSSESSION_CHANGE
+                && msg.wParam == WPARAM(WTS_SESSION_UNLOCK)
+            {
+                session_unlocked = true;
             }
             let _ = TranslateMessage(msg);
             DispatchMessageW(msg);
         }
     }
-    false
+    if session_unlocked {
+        DrainResult::SessionUnlock
+    } else {
+        DrainResult::Continue
+    }
 }
 
 /// Wait for new input/messages or until timeout expires.
 fn wait_for_message_or_timeout(timeout_ms: u32) {
     unsafe {
         let _ = MsgWaitForMultipleObjects(None, false, timeout_ms, QS_ALLINPUT);
+    }
+}
+
+/// Create a message-only window and register for session change notifications.
+/// Returns the window handle, or `None` if setup fails (non-fatal -- hooks still work,
+/// they just won't auto-recover after session lock/unlock).
+unsafe fn create_session_notification_window() -> Option<HWND> {
+    let class_name: Vec<u16> = "HandyKeysSessionWatcher\0".encode_utf16().collect();
+    let wnd_class = WNDCLASSW {
+        lpfnWndProc: Some(windows::Win32::UI::WindowsAndMessaging::DefWindowProcW),
+        lpszClassName: windows::core::PCWSTR(class_name.as_ptr()),
+        ..Default::default()
+    };
+    RegisterClassW(&wnd_class);
+
+    let hwnd = CreateWindowExW(
+        WINDOW_EX_STYLE::default(),
+        windows::core::PCWSTR(class_name.as_ptr()),
+        windows::core::PCWSTR(ptr::null()),
+        WINDOW_STYLE::default(),
+        0,
+        0,
+        0,
+        0,
+        Some(HWND_MESSAGE),
+        None,
+        None,
+        None,
+    );
+
+    let hwnd = match hwnd {
+        Ok(h) => h,
+        Err(_) => return None,
+    };
+
+    if WTSRegisterSessionNotification(hwnd, NOTIFY_FOR_THIS_SESSION).is_err() {
+        let _ = DestroyWindow(hwnd);
+        return None;
+    }
+
+    Some(hwnd)
+}
+
+/// Clean up the session notification window.
+unsafe fn destroy_session_notification_window(hwnd: HWND) {
+    let _ = WTSUnRegisterSessionNotification(hwnd);
+    let _ = DestroyWindow(hwnd);
+}
+
+/// Re-install low-level hooks after session unlock invalidated them.
+/// Returns the new hook handles, or `None` on failure.
+unsafe fn reinstall_hooks(
+    old_kb: windows::Win32::UI::WindowsAndMessaging::HHOOK,
+    old_mouse: windows::Win32::UI::WindowsAndMessaging::HHOOK,
+) -> Option<(
+    windows::Win32::UI::WindowsAndMessaging::HHOOK,
+    windows::Win32::UI::WindowsAndMessaging::HHOOK,
+)> {
+    let _ = UnhookWindowsHookEx(old_kb);
+    let _ = UnhookWindowsHookEx(old_mouse);
+
+    let kb = SetWindowsHookExW(WH_KEYBOARD_LL, Some(keyboard_hook_proc), None, 0).ok()?;
+    match SetWindowsHookExW(WH_MOUSE_LL, Some(mouse_hook_proc), None, 0) {
+        Ok(mouse) => Some((kb, mouse)),
+        Err(_) => {
+            let _ = UnhookWindowsHookEx(kb);
+            None
+        }
     }
 }
 
@@ -86,7 +185,7 @@ pub(crate) fn spawn(blocking_hotkeys: Option<BlockingHotkeys>) -> Result<Windows
         let kb_hook =
             unsafe { SetWindowsHookExW(WH_KEYBOARD_LL, Some(keyboard_hook_proc), None, 0) };
 
-        let kb_hook = match kb_hook {
+        let mut kb_hook = match kb_hook {
             Ok(h) => h,
             Err(e) => {
                 eprintln!("Failed to install keyboard hook: {:?}", e);
@@ -97,17 +196,20 @@ pub(crate) fn spawn(blocking_hotkeys: Option<BlockingHotkeys>) -> Result<Windows
         // Install the low-level mouse hook
         let mouse_hook = unsafe { SetWindowsHookExW(WH_MOUSE_LL, Some(mouse_hook_proc), None, 0) };
 
-        let mouse_hook = match mouse_hook {
+        let mut mouse_hook = match mouse_hook {
             Ok(h) => h,
             Err(e) => {
                 eprintln!("Failed to install mouse hook: {:?}", e);
-                // Clean up keyboard hook before returning
                 unsafe {
                     let _ = UnhookWindowsHookEx(kb_hook);
                 }
                 return;
             }
         };
+
+        // Register for session change notifications so we can re-install hooks
+        // after Win+L lock/unlock (the Winlogon desktop switch invalidates them).
+        let session_hwnd = unsafe { create_session_notification_window() };
 
         // Message loop - required for low-level hooks to function.
         // Keep the short timeout so shutdown polling behavior remains unchanged.
@@ -119,13 +221,31 @@ pub(crate) fn spawn(blocking_hotkeys: Option<BlockingHotkeys>) -> Result<Windows
             }
 
             // Process all pending messages
-            if drain_thread_messages(&mut msg) {
-                break;
+            match drain_thread_messages(&mut msg) {
+                DrainResult::Quit => break,
+                DrainResult::SessionUnlock => unsafe {
+                    if let Some((new_kb, new_mouse)) = reinstall_hooks(kb_hook, mouse_hook) {
+                        kb_hook = new_kb;
+                        mouse_hook = new_mouse;
+                        eprintln!("handy-keys: hooks re-installed after session unlock");
+                    } else {
+                        eprintln!("handy-keys: failed to re-install hooks after session unlock");
+                        break;
+                    }
+                },
+                DrainResult::Continue => {}
             }
 
-            // Wait for messages or timeout — unlike thread::sleep, this returns
+            // Wait for messages or timeout -- unlike thread::sleep, this returns
             // immediately when a message arrives, so hook callbacks are never delayed.
             wait_for_message_or_timeout(HOOK_LOOP_TIMEOUT_MS);
+        }
+
+        // Clean up session notification window
+        if let Some(hwnd) = session_hwnd {
+            unsafe {
+                destroy_session_notification_window(hwnd);
+            }
         }
 
         // Clean up the hooks
@@ -349,7 +469,7 @@ mod tests {
             PostQuitMessage(0);
         }
         let mut msg = MSG::default();
-        assert!(drain_thread_messages(&mut msg));
+        assert!(matches!(drain_thread_messages(&mut msg), DrainResult::Quit));
         clear_message_queue();
     }
 }
