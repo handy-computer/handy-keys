@@ -92,6 +92,11 @@
 //!
 //! Uses [rdev](https://crates.io/crates/rdev). On Wayland, hotkey blocking may not
 //! work due to compositor restrictions.
+//!
+//! An opt-in read-only evdev backend is available with the `linux-evdev-readonly`
+//! feature. It observes global key events but does not block them from reaching
+//! other applications, including when using `new_with_blocking`. It scans input
+//! devices at startup and requires read access to `/dev/input/event*` devices.
 
 mod error;
 mod listener;

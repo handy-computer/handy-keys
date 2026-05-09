@@ -7,8 +7,9 @@
 //!
 //! - **macOS**: Uses CGEventTap. Requires accessibility permissions.
 //! - **Windows**: Uses low-level keyboard hooks. Clean thread shutdown.
-//! - **Linux**: Uses rdev. On Wayland, blocking may not work due to
-//!   compositor restrictions. Thread cleanup is limited.
+//! - **Linux**: Uses rdev by default. On Wayland, blocking may not work due to
+//!   compositor restrictions. The `linux-evdev-readonly` feature observes events
+//!   but cannot block them. Thread cleanup is limited.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, TryRecvError};
@@ -45,10 +46,12 @@ impl KeyboardListener {
     /// Create a new KeyboardListener with blocking support
     ///
     /// Events matching hotkeys in the provided set will be blocked from reaching
-    /// other applications. The set can be modified after creation to add/remove
-    /// hotkeys dynamically.
+    /// other applications when the active platform backend supports blocking.
+    /// The set can be modified after creation to add/remove hotkeys dynamically.
     ///
     /// Note: On Wayland, blocking may not work due to compositor restrictions.
+    /// When built with `linux-evdev-readonly`, Linux observes events but never
+    /// blocks them.
     pub fn new_with_blocking(blocking_hotkeys: BlockingHotkeys) -> Result<Self> {
         Self::new_internal(Some(blocking_hotkeys))
     }

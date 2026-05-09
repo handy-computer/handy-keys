@@ -183,6 +183,7 @@ version = "0.2.4"
 dependencies = [
  "bitflags 2.10.0",
  "block2",
+ "evdev-rs",
  "objc2",
  "objc2-app-kit",
  "objc2-core-foundation",

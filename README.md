@@ -66,6 +66,16 @@ Uses low-level keyboard hooks. No special permissions required.
 
 Uses [rdev](https://crates.io/crates/rdev). On Wayland, hotkey blocking may not work due to compositor restrictions.
 
+An opt-in read-only evdev backend is available for Linux builds:
+
+```toml
+handy-keys = { version = "0.2", default-features = false, features = ["linux-evdev-readonly"] }
+```
+
+The evdev backend observes global key events but does not block them from reaching other applications, including when
+using `new_with_blocking`. It scans input devices at startup and requires read access to `/dev/input/event*` devices,
+typically via udev ACLs or the `input` group.
+
 ## Modifiers
 
 | Modifier | Aliases |
