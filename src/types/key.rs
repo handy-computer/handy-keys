@@ -136,6 +136,13 @@ pub enum Key {
     ScrollLock,
     NumLock,
 
+    /// The Globe / Fn key on newer Apple keyboards (M-series MacBooks, Magic Keyboard
+    /// with Touch ID). Reported as a regular `KeyDown`/`KeyUp` event with
+    /// `MaskSecondaryFn` set in the event flags (macOS virtual keycode `0xB0`).
+    ///
+    /// This key doubles as the dedicated dictation trigger on supported hardware.
+    Globe,
+
     // Mouse buttons
     MouseLeft,
     MouseRight,
@@ -263,6 +270,7 @@ impl fmt::Display for Key {
             Key::MouseMiddle => write!(f, "MouseMiddle"),
             Key::MouseX1 => write!(f, "MouseX1"),
             Key::MouseX2 => write!(f, "MouseX2"),
+            Key::Globe => write!(f, "Globe"),
         }
     }
 }
@@ -405,6 +413,9 @@ impl FromStr for Key {
             "mousemiddle" | "middleclick" | "mmb" | "mouse3" => Ok(Key::MouseMiddle),
             "mousex1" | "mouse4" | "back" | "xbutton1" => Ok(Key::MouseX1),
             "mousex2" | "mouse5" | "forward" | "xbutton2" => Ok(Key::MouseX2),
+
+            // Globe / dictation key (newer Apple keyboards, macOS keycode 0xB0)
+            "globe" | "dictation" | "fn_key" => Ok(Key::Globe),
 
             _ => Err(Error::UnknownKey(s.to_string())),
         }
