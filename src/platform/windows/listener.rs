@@ -228,6 +228,8 @@ unsafe extern "system" fn mouse_hook_proc(code: i32, wparam: WPARAM, lparam: LPA
         return CallNextHookEx(None, code, wparam, lparam);
     }
 
+    let mut should_block = false;
+
     // Process the mouse event
     HOOK_CONTEXT.with(|ctx_cell| {
         let mut ctx_ref = ctx_cell.borrow_mut();
@@ -272,6 +274,9 @@ unsafe extern "system" fn mouse_hook_proc(code: i32, wparam: WPARAM, lparam: LPA
             };
 
             if let Some(key) = key {
+                should_block =
+                    should_block_hotkey(&ctx.blocking_hotkeys, ctx.current_modifiers, Some(key));
+
                 let _ = ctx.event_sender.send(KeyEvent {
                     modifiers: ctx.current_modifiers,
                     key: Some(key),
@@ -282,8 +287,13 @@ unsafe extern "system" fn mouse_hook_proc(code: i32, wparam: WPARAM, lparam: LPA
         }
     });
 
-    // Always pass mouse events through (no blocking for mouse)
-    CallNextHookEx(None, code, wparam, lparam)
+    if should_block {
+        // Return non-zero to block the event from propagating
+        LRESULT(1)
+    } else {
+        // Pass to next hook in chain
+        CallNextHookEx(None, code, wparam, lparam)
+    }
 }
 
 /// Check if a hotkey combination should be blocked
@@ -351,5 +361,23 @@ mod tests {
         let mut msg = MSG::default();
         assert!(drain_thread_messages(&mut msg));
         clear_message_queue();
+    }
+
+    #[test]
+    fn should_block_registered_mouse_hotkey() {
+        let mut hotkeys = std::collections::HashSet::new();
+        hotkeys.insert(Hotkey::new(Modifiers::empty(), Key::MouseX1).unwrap());
+        let blocking_hotkeys = Some(std::sync::Arc::new(std::sync::Mutex::new(hotkeys)));
+
+        assert!(should_block_hotkey(
+            &blocking_hotkeys,
+            Modifiers::empty(),
+            Some(Key::MouseX1)
+        ));
+        assert!(!should_block_hotkey(
+            &blocking_hotkeys,
+            Modifiers::empty(),
+            Some(Key::MouseX2)
+        ));
     }
 }
