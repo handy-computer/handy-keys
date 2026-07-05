@@ -1,9 +1,6 @@
 # Testing
 
-There is no CI; every PR is verified locally before merge. Testing has
-three layers — run the ones that match what your change touches.
-
-## 1. Unit tests — any machine
+## 1. Unit tests
 
 ```sh
 cargo test
@@ -13,7 +10,7 @@ Covers the platform-independent logic: hotkey matching, modifier
 semantics, string parsing, and the manager's press/release state machine.
 Always run this; it must stay green on every commit.
 
-## 2. Cross-target check — any machine
+## 2. Cross-target check
 
 ```sh
 ./scripts/check-all.sh
@@ -70,11 +67,3 @@ carry Fn on this keyboard?", "what does this layout report for the key
 next to 1?") and ask bug reporters to paste its output. A key that
 produces *no* output is itself a finding — it means the platform backend
 cannot map it.
-
-## Pre-merge checklist
-
-1. `cargo test` — green.
-2. `./scripts/check-all.sh` — green.
-3. If the change touches a platform backend: run layer 3 on that machine,
-   plus any scenario checks the PR calls out (e.g. lock/unlock cycles for
-   Windows session handling).
