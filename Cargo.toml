@@ -22,6 +22,10 @@ path = "examples/basic.rs"
 name = "record_hotkey"
 path = "examples/record_hotkey.rs"
 
+[[example]]
+name = "diagnostic"
+path = "examples/diagnostic.rs"
+
 [dependencies]
 bitflags = { version = "2", features = ["serde"] }
 serde = { version = "1", features = ["derive"] }
@@ -43,3 +47,10 @@ windows = { version = "0.58", features = [
 
 [target.'cfg(target_os = "linux")'.dependencies]
 rdev = { version = "0.5.3", features = ["unstable_grab"] }
+
+# Synthetic input injection for the integration tests (tests/synthetic_input.rs)
+[target.'cfg(target_os = "windows")'.dev-dependencies]
+windows = { version = "0.58", features = [
+    "Win32_Foundation",
+    "Win32_UI_Input_KeyboardAndMouse",
+] }
