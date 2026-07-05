@@ -52,13 +52,17 @@ impl ManagerState {
             }
         } else {
             // Check for hotkeys that should be released
-            // A hotkey is released when either its key is released or its modifiers change
+            // A hotkey is released when its key is released, or — for modifier
+            // events — when the modifiers no longer match. A modifier event
+            // (key == None) whose modifiers still match must not release a
+            // modifier-only hotkey (e.g. tapping Shift while a Cmd-only hotkey
+            // is held).
             let to_release: Vec<HotkeyId> = self
                 .hotkeys
                 .iter()
                 .filter(|(&id, hotkey)| {
                     self.pressed_hotkeys.contains(&id)
-                        && (hotkey.key == event.key
+                        && ((event.key.is_some() && hotkey.key == event.key)
                             || (event.key.is_none() && !hotkey.modifiers.matches(event.modifiers)))
                 })
                 .map(|(&id, _)| id)
@@ -486,6 +490,101 @@ mod tests {
             let results = state.process_event(&event);
 
             assert_eq!(results.len(), 0);
+        }
+
+        #[test]
+        fn modifier_only_hotkey_not_released_by_unrelated_modifier() {
+            let mut state = ManagerState::new();
+            let hotkey = Hotkey::new(Modifiers::CMD, None).unwrap();
+            let id = HotkeyId(0);
+            state.hotkeys.insert(id, hotkey);
+
+            // Cmd down — hotkey pressed
+            let event = make_modifier_event(Modifiers::CMD_LEFT, true, Modifiers::CMD_LEFT);
+            let results = state.process_event(&event);
+            assert_eq!(results.len(), 1);
+            assert_eq!(results[0].state, HotkeyState::Pressed);
+
+            // Shift down while Cmd held — no state change
+            let event = make_modifier_event(
+                Modifiers::CMD_LEFT | Modifiers::SHIFT_LEFT,
+                true,
+                Modifiers::SHIFT_LEFT,
+            );
+            assert_eq!(state.process_event(&event).len(), 0);
+
+            // Shift up — Cmd is still held and still matches, so the hotkey
+            // must NOT be released
+            let event = make_modifier_event(Modifiers::CMD_LEFT, false, Modifiers::SHIFT_LEFT);
+            assert_eq!(state.process_event(&event).len(), 0);
+            assert!(state.pressed_hotkeys.contains(&id));
+
+            // Cmd up — now it releases
+            let event = make_modifier_event(Modifiers::empty(), false, Modifiers::CMD_LEFT);
+            let results = state.process_event(&event);
+            assert_eq!(results.len(), 1);
+            assert_eq!(results[0].state, HotkeyState::Released);
+            assert!(!state.pressed_hotkeys.contains(&id));
+        }
+
+        #[test]
+        fn modifier_only_hotkey_releases_on_own_modifier_release() {
+            let mut state = ManagerState::new();
+            let hotkey = Hotkey::new(Modifiers::CMD, None).unwrap();
+            let id = HotkeyId(0);
+            state.hotkeys.insert(id, hotkey);
+
+            let event = make_modifier_event(Modifiers::CMD_LEFT, true, Modifiers::CMD_LEFT);
+            state.process_event(&event);
+            assert!(state.pressed_hotkeys.contains(&id));
+
+            let event = make_modifier_event(Modifiers::empty(), false, Modifiers::CMD_LEFT);
+            let results = state.process_event(&event);
+            assert_eq!(results.len(), 1);
+            assert_eq!(results[0].state, HotkeyState::Released);
+        }
+
+        #[test]
+        fn compound_modifier_only_hotkey_releases_on_partial_release() {
+            let mut state = ManagerState::new();
+            let hotkey = Hotkey::new(Modifiers::CMD | Modifiers::SHIFT, None).unwrap();
+            let id = HotkeyId(0);
+            state.hotkeys.insert(id, hotkey);
+
+            // Cmd down, then Shift down — pressed once both are held
+            let event = make_modifier_event(Modifiers::CMD_LEFT, true, Modifiers::CMD_LEFT);
+            assert_eq!(state.process_event(&event).len(), 0);
+            let event = make_modifier_event(
+                Modifiers::CMD_LEFT | Modifiers::SHIFT_LEFT,
+                true,
+                Modifiers::SHIFT_LEFT,
+            );
+            let results = state.process_event(&event);
+            assert_eq!(results.len(), 1);
+            assert_eq!(results[0].state, HotkeyState::Pressed);
+
+            // Releasing either modifier breaks the match — released
+            let event = make_modifier_event(Modifiers::SHIFT_LEFT, false, Modifiers::CMD_LEFT);
+            let results = state.process_event(&event);
+            assert_eq!(results.len(), 1);
+            assert_eq!(results[0].state, HotkeyState::Released);
+        }
+
+        #[test]
+        fn keyed_hotkey_not_released_by_unrelated_key_release() {
+            let mut state = ManagerState::new();
+            let hotkey = Hotkey::new(Modifiers::CMD, Key::K).unwrap();
+            let id = HotkeyId(0);
+            state.hotkeys.insert(id, hotkey);
+
+            let event = make_key_event(Modifiers::CMD_LEFT, Some(Key::K), true);
+            state.process_event(&event);
+            assert!(state.pressed_hotkeys.contains(&id));
+
+            // Release of a different key while Cmd+K is held — no release
+            let event = make_key_event(Modifiers::CMD_LEFT, Some(Key::J), false);
+            assert_eq!(state.process_event(&event).len(), 0);
+            assert!(state.pressed_hotkeys.contains(&id));
         }
 
         #[test]
