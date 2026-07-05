@@ -136,12 +136,19 @@ pub enum Key {
     ScrollLock,
     NumLock,
 
-    /// The Globe / Fn key on newer Apple keyboards (M-series MacBooks, Magic Keyboard
-    /// with Touch ID). Reported as a regular `KeyDown`/`KeyUp` event with
-    /// `MaskSecondaryFn` set in the event flags (macOS virtual keycode `0xB0`).
+    /// The dictation / voice key (macOS virtual keycode `0xB0`, macOS only).
     ///
-    /// This key doubles as the dedicated dictation trigger on supported hardware.
-    Globe,
+    /// Emitted by the microphone/dictation key on the media function row
+    /// (the F5 position on recent Apple keyboards), and by the Globe/Fn key
+    /// when System Settings configures it to start dictation. A Globe tap
+    /// configured for anything else emits `Fn` modifier flags plus a
+    /// different keycode instead.
+    ///
+    /// Hardware events carry `MaskSecondaryFn` in their flags, so hotkeys
+    /// recorded from a key press pair this with the `Fn` modifier (a
+    /// string-configured `"dictation"` hotkey without `fn` will not match
+    /// hardware presses until FN matching is reworked).
+    Dictation,
 
     // Mouse buttons
     MouseLeft,
@@ -270,7 +277,7 @@ impl fmt::Display for Key {
             Key::MouseMiddle => write!(f, "MouseMiddle"),
             Key::MouseX1 => write!(f, "MouseX1"),
             Key::MouseX2 => write!(f, "MouseX2"),
-            Key::Globe => write!(f, "Globe"),
+            Key::Dictation => write!(f, "Dictation"),
         }
     }
 }
@@ -414,8 +421,10 @@ impl FromStr for Key {
             "mousex1" | "mouse4" | "back" | "xbutton1" => Ok(Key::MouseX1),
             "mousex2" | "mouse5" | "forward" | "xbutton2" => Ok(Key::MouseX2),
 
-            // Globe / dictation key (newer Apple keyboards, macOS keycode 0xB0)
-            "globe" | "dictation" | "fn_key" => Ok(Key::Globe),
+            // Dictation / voice key (macOS keycode 0xB0). "globe" is accepted
+            // because the Globe key emits this keycode when configured to
+            // start dictation.
+            "dictation" | "voice" | "globe" => Ok(Key::Dictation),
 
             _ => Err(Error::UnknownKey(s.to_string())),
         }
@@ -514,11 +523,21 @@ mod tests {
             Key::JisUnderscore,
             Key::JisEisu,
             Key::JisKana,
+            Key::Dictation,
         ];
         for key in keys {
             let displayed = format!("{}", key);
             let parsed: Key = displayed.parse().unwrap();
             assert_eq!(parsed, key, "Roundtrip failed for {:?}", key);
         }
+    }
+
+    #[test]
+    fn parse_dictation_aliases() {
+        assert_eq!("dictation".parse::<Key>().unwrap(), Key::Dictation);
+        assert_eq!("voice".parse::<Key>().unwrap(), Key::Dictation);
+        assert_eq!("globe".parse::<Key>().unwrap(), Key::Dictation);
+        // "fn" must keep parsing as the Fn *modifier*, not a key
+        assert!("fn".parse::<Key>().is_err());
     }
 }

@@ -98,10 +98,6 @@ mod keycodes {
     pub const JIS_EISU: u16 = 0x66;
     pub const JIS_KANA: u16 = 0x68;
     pub const F5: u16 = 0x60;
-    /// Globe / Fn key on newer Apple keyboards (M-series MacBooks, Magic Keyboard
-    /// with Touch ID). Verified via CGEventTap at `kCGHIDEventTap`; the key
-    /// arrives as a normal `KeyDown`/`KeyUp` pair with `MaskSecondaryFn` in flags.
-    pub const GLOBE: u16 = 0xB0;
     pub const F6: u16 = 0x61;
     pub const F7: u16 = 0x62;
     pub const F3: u16 = 0x63;
@@ -127,6 +123,10 @@ mod keycodes {
     pub const RIGHT_ARROW: u16 = 0x7C;
     pub const DOWN_ARROW: u16 = 0x7D;
     pub const UP_ARROW: u16 = 0x7E;
+    /// Dictation / voice key. Emitted by the media-row mic key (F5 position)
+    /// and by the Globe key when configured to start dictation. Arrives as a
+    /// normal `KeyDown`/`KeyUp` pair with `MaskSecondaryFn` set in flags.
+    pub const DICTATION: u16 = 0xB0;
 }
 
 /// Convert a macOS virtual keycode to a Key enum
@@ -239,7 +239,7 @@ pub fn keycode_to_key(keycode: CGKeyCode) -> Option<Key> {
         keycodes::JIS_EISU => Some(Key::JisEisu),
         keycodes::JIS_KANA => Some(Key::JisKana),
         keycodes::CAPS_LOCK => Some(Key::CapsLock),
-        keycodes::GLOBE => Some(Key::Globe),
+        keycodes::DICTATION => Some(Key::Dictation),
         _ => None,
     }
 }
