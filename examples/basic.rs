@@ -1,7 +1,4 @@
-use handy_keys::{
-    check_accessibility, open_accessibility_settings, Hotkey, HotkeyManager, HotkeyState, Key,
-    Modifiers, Result,
-};
+use handy_keys::{Hotkey, HotkeyManager, HotkeyState, Key, Modifiers, Result};
 use std::io::Write;
 
 fn log(msg: &str) {
@@ -19,18 +16,23 @@ fn log(msg: &str) {
 
 fn main() -> Result<()> {
     log("=== Starting keyboard test ===");
-    // Check accessibility permission
-    let has_access = check_accessibility();
-    log(&format!("Accessibility permission check: {}", has_access));
+    // Check accessibility permission (macOS only)
+    #[cfg(target_os = "macos")]
+    {
+        use handy_keys::{check_accessibility, open_accessibility_settings};
 
-    if !has_access {
-        log("Accessibility permission not granted!");
-        log("Opening System Settings...");
-        if let Err(e) = open_accessibility_settings() {
-            log(&format!("Failed to open settings: {}", e));
+        let has_access = check_accessibility();
+        log(&format!("Accessibility permission check: {}", has_access));
+
+        if !has_access {
+            log("Accessibility permission not granted!");
+            log("Opening System Settings...");
+            if let Err(e) = open_accessibility_settings() {
+                log(&format!("Failed to open settings: {}", e));
+            }
+            log("Please grant permission and restart.");
+            std::process::exit(1);
         }
-        log("Please grant permission and restart.");
-        std::process::exit(1);
     }
 
     log("Creating hotkey manager...");
