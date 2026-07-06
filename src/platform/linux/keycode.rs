@@ -53,10 +53,8 @@ pub fn key_code_to_key(code: KeyCode) -> Option<Key> {
         KeyCode::KEY_8 => Some(Key::Num8),
         KeyCode::KEY_9 => Some(Key::Num9),
 
-        // Function keys. F13-F20 (codes 183-190) matter for dictation
+        // Function keys. F13-F24 (codes 183-194) matter for dictation
         // hotkeys: foot pedals and macro pads emit them.
-        // TODO: map KEY_F21..KEY_F24 (191-194) once the Key enum grows
-        // F21-F24 variants (a Windows PR adding them is in flight).
         KeyCode::KEY_F1 => Some(Key::F1),
         KeyCode::KEY_F2 => Some(Key::F2),
         KeyCode::KEY_F3 => Some(Key::F3),
@@ -77,6 +75,10 @@ pub fn key_code_to_key(code: KeyCode) -> Option<Key> {
         KeyCode::KEY_F18 => Some(Key::F18),
         KeyCode::KEY_F19 => Some(Key::F19),
         KeyCode::KEY_F20 => Some(Key::F20),
+        KeyCode::KEY_F21 => Some(Key::F21),
+        KeyCode::KEY_F22 => Some(Key::F22),
+        KeyCode::KEY_F23 => Some(Key::F23),
+        KeyCode::KEY_F24 => Some(Key::F24),
 
         // Special keys
         KeyCode::KEY_SPACE => Some(Key::Space),
@@ -193,13 +195,14 @@ mod tests {
 
     #[test]
     fn maps_extended_function_keys() {
-        // F13-F24 were unreachable with the old rdev backend; F13-F20 must
-        // map (F21-F24 blocked on Key enum variants, see TODO above).
+        // F13-F24 were unreachable with the old rdev backend.
         assert_eq!(key_code_to_key(KeyCode::KEY_F13), Some(Key::F13));
         assert_eq!(key_code_to_key(KeyCode::KEY_F20), Some(Key::F20));
-        // Raw code sanity check: KEY_F13..KEY_F20 are 183..190.
+        assert_eq!(key_code_to_key(KeyCode::KEY_F21), Some(Key::F21));
+        assert_eq!(key_code_to_key(KeyCode::KEY_F24), Some(Key::F24));
+        // Raw code sanity check: KEY_F13..KEY_F24 are 183..194.
         assert_eq!(KeyCode::KEY_F13.0, 183);
-        assert_eq!(KeyCode::KEY_F20.0, 190);
+        assert_eq!(KeyCode::KEY_F24.0, 194);
     }
 
     #[test]
