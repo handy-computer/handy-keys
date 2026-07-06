@@ -22,14 +22,12 @@ without sitting at that machine. Needs the target stdlibs once:
 
 ```sh
 rustup target add x86_64-pc-windows-msvc    # from macOS/Linux
+rustup target add x86_64-unknown-linux-gnu  # from other hosts
 rustup target add aarch64-apple-darwin      # from other hosts
 ```
 
-Known limitation: the Linux target cannot be cross-checked because rdev's
-`evdev-sys` dependency builds C libevdev via autotools. Until the rdev
-backend is replaced with a pure-Rust evdev implementation, Linux compile
-errors only surface when building on a Linux machine (which additionally
-needs autotools installed for that same dependency).
+All three targets cross-check cleanly: every platform backend, including
+the Linux evdev one, is pure Rust with no C build step.
 
 ## 3. Integration tests — on the target machine
 
@@ -46,10 +44,15 @@ by default because they need a real interactive session.
   Injection uses `CGEventPost`.
 - **Windows**: requires an interactive desktop session. Injection uses
   `SendInput`.
-- **Linux**: no harness yet — the rdev backend exclusively grabs real
-  input devices, which is unsafe to drive from a test. A uinput-based
-  harness (virtual keyboard, indistinguishable from hardware at the evdev
-  layer) lands with the in-tree evdev backend.
+- **Linux**: requires read access to `/dev/input` (`input` group
+  membership) and write access to `/dev/uinput` (e.g.
+  `sudo chmod 666 /dev/uinput` for the session, or a udev rule).
+  Injection creates a uinput virtual keyboard — indistinguishable from
+  hardware at the evdev layer — and covers the startup device scan,
+  inotify hotplug, and hotkey blocking (a second listener asserts the
+  blocked key never comes out of the grab-and-reinject pipeline).
+  Note: the blocking test briefly grabs all keyboards, including real
+  ones; keystrokes typed during it pass through the re-injection path.
 
 The tests inject **F20** only: it exists in the `Key` enum everywhere and
 does nothing in terminals or desktop environments, so a test run never

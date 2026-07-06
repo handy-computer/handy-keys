@@ -17,15 +17,14 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 use windows::Win32::UI::WindowsAndMessaging::{
     CallNextHookEx, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
     MsgWaitForMultipleObjects, PeekMessageW, RegisterClassW, SetWindowsHookExW, TranslateMessage,
-    UnhookWindowsHookEx, HHOOK, HWND_MESSAGE, KBDLLHOOKSTRUCT, LLKHF_EXTENDED, MSG,
-    MSLLHOOKSTRUCT, PM_REMOVE, QS_ALLINPUT, WH_KEYBOARD_LL, WH_MOUSE_LL, WINDOW_EX_STYLE,
-    WINDOW_STYLE, WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP,
-    WM_QUIT, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SYSKEYDOWN, WM_XBUTTONDOWN, WM_XBUTTONUP,
-    WNDCLASSW,
+    UnhookWindowsHookEx, HHOOK, HWND_MESSAGE, KBDLLHOOKSTRUCT, LLKHF_EXTENDED, MSG, MSLLHOOKSTRUCT,
+    PM_REMOVE, QS_ALLINPUT, WH_KEYBOARD_LL, WH_MOUSE_LL, WINDOW_EX_STYLE, WINDOW_STYLE, WM_KEYDOWN,
+    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_QUIT, WM_RBUTTONDOWN,
+    WM_RBUTTONUP, WM_SYSKEYDOWN, WM_XBUTTONDOWN, WM_XBUTTONUP, WNDCLASSW,
 };
 
 use crate::error::Result;
-use crate::platform::state::BlockingHotkeys;
+use crate::platform::state::{release_events, stale_modifiers, BlockingHotkeys, RECONCILABLE};
 use crate::types::{Key, KeyEvent, Modifiers};
 
 use super::keycode::{vk_to_key, vk_to_modifier};
@@ -41,7 +40,8 @@ const WTS_REMOTE_CONNECT: usize = 0x3;
 const WTS_SESSION_LOCK: usize = 0x7;
 const WTS_SESSION_UNLOCK: usize = 0x8;
 
-/// The side-specific modifier keys we track, paired with their virtual-key codes.
+/// The side-specific modifier keys we track, paired with their virtual-key
+/// codes. Ordered to match `state::MODIFIER_RELEASE_ORDER`.
 const MODIFIER_KEYS: [(VIRTUAL_KEY, Modifiers); 8] = [
     (VK_LWIN, Modifiers::CMD_LEFT),
     (VK_RWIN, Modifiers::CMD_RIGHT),
@@ -52,13 +52,6 @@ const MODIFIER_KEYS: [(VIRTUAL_KEY, Modifiers); 8] = [
     (VK_LMENU, Modifiers::OPT_LEFT),
     (VK_RMENU, Modifiers::OPT_RIGHT),
 ];
-
-/// Every modifier bit reconciliation may touch. FN is excluded: Windows never
-/// reports it, so reconciliation must not clear it.
-const RECONCILABLE: Modifiers = Modifiers::CMD
-    .union(Modifiers::SHIFT)
-    .union(Modifiers::CTRL)
-    .union(Modifiers::OPT);
 
 /// Thread-local state for the keyboard hook callback.
 ///
@@ -134,31 +127,6 @@ fn physical_modifiers() -> Modifiers {
         }
     }
     held
-}
-
-/// Modifiers we track as held that are no longer physically held.
-fn stale_modifiers(tracked: Modifiers, physical: Modifiers) -> Modifiers {
-    (tracked & RECONCILABLE) & !physical
-}
-
-/// Build the synthetic release events that clear `stale` from `tracked`, in
-/// MODIFIER_KEYS order. Each event carries the modifier set as it shrinks,
-/// exactly as if the keys had been released one by one.
-fn release_events(tracked: Modifiers, stale: Modifiers) -> Vec<KeyEvent> {
-    let mut modifiers = tracked;
-    let mut events = Vec::new();
-    for (_, modifier) in MODIFIER_KEYS {
-        if stale.contains(modifier) {
-            modifiers &= !modifier;
-            events.push(KeyEvent {
-                modifiers,
-                key: None,
-                is_key_down: false,
-                changed_modifier: Some(modifier),
-            });
-        }
-    }
-    events
 }
 
 /// Reconcile tracked modifiers against the physical keyboard state.
@@ -704,52 +672,6 @@ mod tests {
         clear_message_queue();
     }
 
-    #[test]
-    fn stale_modifiers_flags_released_keys() {
-        // Tracked Win+Ctrl, but only Ctrl still physically held: Win is stale.
-        let stale = stale_modifiers(
-            Modifiers::CMD_LEFT | Modifiers::CTRL_LEFT,
-            Modifiers::CTRL_LEFT,
-        );
-        assert_eq!(stale, Modifiers::CMD_LEFT);
-    }
-
-    #[test]
-    fn stale_modifiers_empty_when_state_matches() {
-        let tracked = Modifiers::SHIFT_LEFT | Modifiers::OPT_RIGHT;
-        assert_eq!(stale_modifiers(tracked, tracked), Modifiers::empty());
-        assert_eq!(
-            stale_modifiers(Modifiers::empty(), Modifiers::CTRL_LEFT),
-            Modifiers::empty()
-        );
-    }
-
-    #[test]
-    fn stale_modifiers_never_touches_fn() {
-        // FN is not reconcilable on Windows: never reported stale.
-        let stale = stale_modifiers(Modifiers::FN | Modifiers::CMD_LEFT, Modifiers::empty());
-        assert_eq!(stale, Modifiers::CMD_LEFT);
-    }
-
-    #[test]
-    fn release_events_shrink_modifiers_one_key_at_a_time() {
-        let tracked = Modifiers::CMD_LEFT | Modifiers::CTRL_LEFT | Modifiers::FN;
-        let stale = Modifiers::CMD_LEFT | Modifiers::CTRL_LEFT;
-        let events = release_events(tracked, stale);
-
-        assert_eq!(events.len(), 2);
-        // MODIFIER_KEYS order: CMD_LEFT before CTRL_LEFT.
-        assert_eq!(events[0].changed_modifier, Some(Modifiers::CMD_LEFT));
-        assert_eq!(events[0].modifiers, Modifiers::CTRL_LEFT | Modifiers::FN);
-        assert!(!events[0].is_key_down);
-        assert_eq!(events[0].key, None);
-        assert_eq!(events[1].changed_modifier, Some(Modifiers::CTRL_LEFT));
-        assert_eq!(events[1].modifiers, Modifiers::FN);
-        assert!(!events[1].is_key_down);
-    }
-
-    #[test]
-    fn release_events_empty_when_nothing_stale() {
-        assert!(release_events(Modifiers::CMD_LEFT, Modifiers::empty()).is_empty());
-    }
+    // stale_modifiers / release_events themselves are covered in
+    // crate::platform::state, where they now live.
 }

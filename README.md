@@ -64,7 +64,31 @@ Uses low-level keyboard hooks. No special permissions required.
 
 ### Linux
 
-Uses [rdev](https://crates.io/crates/rdev). On Wayland, hotkey blocking may not work due to compositor restrictions.
+Reads evdev devices (`/dev/input/event*`) directly, which works identically on
+Wayland, X11, and the console — no display server connection is needed. Requires
+read access to the device nodes, typically by adding your user to the `input`
+group:
+
+```sh
+sudo usermod -aG input $USER   # then log out and back in
+```
+
+Keyboards plugged in while the listener is running are picked up automatically.
+
+Hotkey **blocking** grabs keyboards exclusively and re-injects every
+non-blocked keystroke through a per-device uinput clone, so it additionally
+requires write access to `/dev/uinput` — for example via a udev rule:
+
+```sh
+echo 'KERNEL=="uinput", GROUP="input", MODE="0660"' | \
+  sudo tee /etc/udev/rules.d/99-handy-keys-uinput.rules
+sudo udevadm control --reload && sudo udevadm trigger /dev/uinput
+```
+
+Without it, the blocking constructors return an actionable error; the
+non-blocking listener only needs `/dev/input` read access. Pointer devices are
+never grabbed, so mouse-button hotkeys are detected but not blocked (matching
+Windows).
 
 ## Modifiers
 

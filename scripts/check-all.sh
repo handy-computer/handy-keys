@@ -5,7 +5,7 @@
 # without sitting at that machine.
 #
 # Cross-target checks need the target's stdlib installed once:
-#   rustup target add x86_64-pc-windows-msvc x86_64-unknown-linux-gnu
+#   rustup target add x86_64-pc-windows-msvc x86_64-unknown-linux-gnu aarch64-apple-darwin
 #
 # See TESTING.md for the full pre-merge checklist.
 set -euo pipefail
@@ -16,12 +16,9 @@ host_triple=$(rustc -vV | sed -n 's/^host: //p')
 echo "==> cargo test ($host_triple)"
 cargo test --quiet
 
-# x86_64-unknown-linux-gnu is intentionally absent: rdev pulls in
-# evdev-sys, which builds C libevdev via autotools and cannot be
-# cross-checked. Re-add it when the in-tree evdev backend (pure Rust)
-# replaces rdev.
 targets=(
     x86_64-pc-windows-msvc
+    x86_64-unknown-linux-gnu
     aarch64-apple-darwin
 )
 installed=$(rustup target list --installed)

@@ -87,7 +87,8 @@ impl ManagerState {
 /// registered hotkeys, emitting `HotkeyEvent`s when matches occur.
 ///
 /// Registered hotkeys are blocked from reaching other applications.
-/// Note: On Linux/Wayland, blocking may not work due to compositor restrictions.
+/// Note: On Linux, blocking requires write access to `/dev/uinput`
+/// (non-blocked keystrokes are re-injected through it).
 pub struct HotkeyManager {
     state: Arc<Mutex<ManagerState>>,
     event_receiver: Receiver<HotkeyEvent>,
@@ -129,7 +130,8 @@ impl HotkeyManager {
     /// On macOS, this will check for accessibility permissions and fail if not granted.
     /// Registered hotkeys will be blocked from reaching other applications.
     ///
-    /// Note: On Linux/Wayland, blocking may not work due to compositor restrictions.
+    /// Note: On Linux, blocking requires write access to `/dev/uinput`
+    /// and this fails with an actionable error without it.
     pub fn new_with_blocking() -> Result<Self> {
         let blocking_hotkeys: BlockingHotkeys = Arc::new(Mutex::new(HashSet::new()));
         let listener = KeyboardListener::new_with_blocking(blocking_hotkeys.clone())?;

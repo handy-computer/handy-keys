@@ -90,8 +90,13 @@
 //!
 //! ## Linux
 //!
-//! Uses [rdev](https://crates.io/crates/rdev). On Wayland, hotkey blocking may not
-//! work due to compositor restrictions.
+//! Reads evdev devices (`/dev/input/event*`) directly, which works the same
+//! on Wayland, X11, and the console. Requires read access to the device
+//! nodes — typically membership in the `input` group. Hotkey *blocking*
+//! grabs keyboards exclusively and re-injects non-blocked events through
+//! uinput, so it additionally requires write access to `/dev/uinput`;
+//! without it, the blocking constructors fail with an actionable error
+//! (the non-blocking listener is unaffected).
 
 mod error;
 mod listener;
