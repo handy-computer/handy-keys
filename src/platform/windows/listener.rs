@@ -5,13 +5,23 @@ use std::sync::mpsc::{self, Sender};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 
-use windows::Win32::Foundation::{LPARAM, LRESULT, WPARAM};
+use windows::core::PCWSTR;
+use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
+use windows::Win32::System::RemoteDesktop::{
+    WTSRegisterSessionNotification, WTSUnRegisterSessionNotification,
+};
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    GetAsyncKeyState, VIRTUAL_KEY, VK_LCONTROL, VK_LMENU, VK_LSHIFT, VK_LWIN, VK_RCONTROL,
+    VK_RMENU, VK_RSHIFT, VK_RWIN,
+};
 use windows::Win32::UI::WindowsAndMessaging::{
-    CallNextHookEx, DispatchMessageW, MsgWaitForMultipleObjects, PeekMessageW, SetWindowsHookExW,
-    TranslateMessage, UnhookWindowsHookEx, KBDLLHOOKSTRUCT, LLKHF_EXTENDED, MSG, MSLLHOOKSTRUCT,
-    PM_REMOVE, QS_ALLINPUT, WH_KEYBOARD_LL, WH_MOUSE_LL, WM_KEYDOWN, WM_LBUTTONDOWN,
-    WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_QUIT, WM_RBUTTONDOWN, WM_RBUTTONUP,
-    WM_SYSKEYDOWN, WM_XBUTTONDOWN, WM_XBUTTONUP,
+    CallNextHookEx, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
+    MsgWaitForMultipleObjects, PeekMessageW, RegisterClassW, SetWindowsHookExW, TranslateMessage,
+    UnhookWindowsHookEx, HHOOK, HWND_MESSAGE, KBDLLHOOKSTRUCT, LLKHF_EXTENDED, MSG,
+    MSLLHOOKSTRUCT, PM_REMOVE, QS_ALLINPUT, WH_KEYBOARD_LL, WH_MOUSE_LL, WINDOW_EX_STYLE,
+    WINDOW_STYLE, WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP,
+    WM_QUIT, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SYSKEYDOWN, WM_XBUTTONDOWN, WM_XBUTTONUP,
+    WNDCLASSW,
 };
 
 use crate::error::Result;
@@ -21,6 +31,34 @@ use crate::types::{Key, KeyEvent, Modifiers};
 use super::keycode::{vk_to_key, vk_to_modifier};
 
 const HOOK_LOOP_TIMEOUT_MS: u32 = 10;
+
+// WTS session notification plumbing not exposed by the `windows` crate bindings.
+const NOTIFY_FOR_THIS_SESSION: u32 = 0;
+const WM_WTSSESSION_CHANGE: u32 = 0x02B1;
+// WM_WTSSESSION_CHANGE wParam values (wtsapi32.h).
+const WTS_CONSOLE_CONNECT: usize = 0x1;
+const WTS_REMOTE_CONNECT: usize = 0x3;
+const WTS_SESSION_LOCK: usize = 0x7;
+const WTS_SESSION_UNLOCK: usize = 0x8;
+
+/// The side-specific modifier keys we track, paired with their virtual-key codes.
+const MODIFIER_KEYS: [(VIRTUAL_KEY, Modifiers); 8] = [
+    (VK_LWIN, Modifiers::CMD_LEFT),
+    (VK_RWIN, Modifiers::CMD_RIGHT),
+    (VK_LSHIFT, Modifiers::SHIFT_LEFT),
+    (VK_RSHIFT, Modifiers::SHIFT_RIGHT),
+    (VK_LCONTROL, Modifiers::CTRL_LEFT),
+    (VK_RCONTROL, Modifiers::CTRL_RIGHT),
+    (VK_LMENU, Modifiers::OPT_LEFT),
+    (VK_RMENU, Modifiers::OPT_RIGHT),
+];
+
+/// Every modifier bit reconciliation may touch. FN is excluded: Windows never
+/// reports it, so reconciliation must not clear it.
+const RECONCILABLE: Modifiers = Modifiers::CMD
+    .union(Modifiers::SHIFT)
+    .union(Modifiers::CTRL)
+    .union(Modifiers::OPT);
 
 /// Thread-local state for the keyboard hook callback.
 ///
@@ -36,18 +74,43 @@ thread_local! {
     static HOOK_CONTEXT: std::cell::RefCell<Option<HookContext>> = const { std::cell::RefCell::new(None) };
 }
 
-/// Drain all pending thread messages and return `true` if WM_QUIT was received.
-fn drain_thread_messages(msg: &mut MSG) -> bool {
+/// What draining the thread message queue observed.
+#[derive(Default)]
+struct DrainOutcome {
+    /// WM_QUIT received -- exit the message loop.
+    quit: bool,
+    /// A session change (lock/unlock/connect) occurred -- reconcile modifier
+    /// state, since key-ups on the secure desktop never reach the hook.
+    session_change: bool,
+    /// The interactive desktop came back (unlock or console/remote connect) --
+    /// re-install hooks in case Windows silently removed them.
+    reinstall_hooks: bool,
+}
+
+/// Drain all pending thread messages.
+fn drain_thread_messages(msg: &mut MSG) -> DrainOutcome {
+    let mut outcome = DrainOutcome::default();
     unsafe {
         while PeekMessageW(msg, None, 0, 0, PM_REMOVE).as_bool() {
             if msg.message == WM_QUIT {
-                return true;
+                outcome.quit = true;
+                return outcome;
+            }
+            if msg.message == WM_WTSSESSION_CHANGE {
+                match msg.wParam.0 {
+                    WTS_SESSION_LOCK => outcome.session_change = true,
+                    WTS_SESSION_UNLOCK | WTS_CONSOLE_CONNECT | WTS_REMOTE_CONNECT => {
+                        outcome.session_change = true;
+                        outcome.reinstall_hooks = true;
+                    }
+                    _ => {}
+                }
             }
             let _ = TranslateMessage(msg);
             DispatchMessageW(msg);
         }
     }
-    false
+    outcome
 }
 
 /// Wait for new input/messages or until timeout expires.
@@ -55,6 +118,166 @@ fn wait_for_message_or_timeout(timeout_ms: u32) {
     unsafe {
         let _ = MsgWaitForMultipleObjects(None, false, timeout_ms, QS_ALLINPUT);
     }
+}
+
+/// Snapshot which tracked modifier keys are physically held right now.
+///
+/// Note: if the calling thread's desktop is not active (e.g. the lock screen's
+/// secure desktop is up), GetAsyncKeyState reports every key as up -- which is
+/// the correct answer for our purposes: treat everything as released.
+fn physical_modifiers() -> Modifiers {
+    let mut held = Modifiers::empty();
+    for (vk, modifier) in MODIFIER_KEYS {
+        // High bit set = key currently down.
+        if unsafe { GetAsyncKeyState(vk.0 as i32) } as u16 & 0x8000 != 0 {
+            held |= modifier;
+        }
+    }
+    held
+}
+
+/// Modifiers we track as held that are no longer physically held.
+fn stale_modifiers(tracked: Modifiers, physical: Modifiers) -> Modifiers {
+    (tracked & RECONCILABLE) & !physical
+}
+
+/// Build the synthetic release events that clear `stale` from `tracked`, in
+/// MODIFIER_KEYS order. Each event carries the modifier set as it shrinks,
+/// exactly as if the keys had been released one by one.
+fn release_events(tracked: Modifiers, stale: Modifiers) -> Vec<KeyEvent> {
+    let mut modifiers = tracked;
+    let mut events = Vec::new();
+    for (_, modifier) in MODIFIER_KEYS {
+        if stale.contains(modifier) {
+            modifiers &= !modifier;
+            events.push(KeyEvent {
+                modifiers,
+                key: None,
+                is_key_down: false,
+                changed_modifier: Some(modifier),
+            });
+        }
+    }
+    events
+}
+
+/// Reconcile tracked modifiers against the physical keyboard state.
+///
+/// Corrects drift from missed events: secure desktop transitions swallow
+/// key-ups (Win+L delivers the Win key DOWN but its UP happens on the secure
+/// desktop), leaving modifiers stuck on until the user happens to press them
+/// again. Mirrors `reconcile_modifiers` in the macOS listener.
+///
+/// Stale modifiers are cleared with synthetic release events so consumers
+/// tracking press/release state recover; missed presses are adopted silently
+/// and ride along on the next real event.
+fn reconcile_modifiers(ctx: &mut HookContext) {
+    let physical = physical_modifiers();
+    for event in release_events(
+        ctx.current_modifiers,
+        stale_modifiers(ctx.current_modifiers, physical),
+    ) {
+        ctx.current_modifiers = event.modifiers;
+        let _ = ctx.event_sender.send(event);
+    }
+    ctx.current_modifiers |= physical & RECONCILABLE & !ctx.current_modifiers;
+}
+
+/// Reconcile modifier state from the hook thread's message loop (used on
+/// session change, where no input event accompanies the state change).
+fn reconcile_modifiers_in_context() {
+    HOOK_CONTEXT.with(|ctx_cell| {
+        if let Some(ctx) = ctx_cell.borrow_mut().as_mut() {
+            reconcile_modifiers(ctx);
+        }
+    });
+}
+
+/// Pass-through wndproc for the session notification window. (The `windows`
+/// crate's DefWindowProcW is a generic Rust wrapper, so it cannot be used as
+/// lpfnWndProc directly.)
+unsafe extern "system" fn session_wndproc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    DefWindowProcW(hwnd, msg, wparam, lparam)
+}
+
+/// Create a message-only window registered for WTS session notifications.
+/// WM_WTSSESSION_CHANGE is posted to it and picked out of the queue by
+/// `drain_thread_messages` (verified live: lock 0x7 and unlock 0x8 both arrive).
+///
+/// Returns None on failure. Non-fatal: hooks still work, and stale modifiers
+/// are still corrected lazily by `reconcile_modifiers` on the next key event.
+unsafe fn create_session_notification_window() -> Option<HWND> {
+    let class_name: Vec<u16> = "HandyKeysSessionWatcher\0".encode_utf16().collect();
+    let wnd_class = WNDCLASSW {
+        lpfnWndProc: Some(session_wndproc),
+        lpszClassName: PCWSTR(class_name.as_ptr()),
+        ..Default::default()
+    };
+    // May fail with ERROR_CLASS_ALREADY_EXISTS (e.g. a second listener in the
+    // same process); CreateWindowExW below still succeeds against the
+    // existing class, so the result is deliberately ignored.
+    RegisterClassW(&wnd_class);
+
+    let hwnd = CreateWindowExW(
+        WINDOW_EX_STYLE::default(),
+        PCWSTR(class_name.as_ptr()),
+        PCWSTR::null(),
+        WINDOW_STYLE::default(),
+        0,
+        0,
+        0,
+        0,
+        HWND_MESSAGE,
+        None,
+        None,
+        None,
+    )
+    .ok()?;
+
+    if WTSRegisterSessionNotification(hwnd, NOTIFY_FOR_THIS_SESSION).is_err() {
+        let _ = DestroyWindow(hwnd);
+        return None;
+    }
+
+    Some(hwnd)
+}
+
+/// Clean up the session notification window. Must run on the creating thread.
+unsafe fn destroy_session_notification_window(hwnd: HWND) {
+    let _ = WTSUnRegisterSessionNotification(hwnd);
+    let _ = DestroyWindow(hwnd);
+}
+
+/// Re-install the low-level hooks, defensively: Windows silently removes an LL
+/// hook whose callback exceeds its timeout budget, and a session away from the
+/// interactive desktop is a common moment for that to surface. (Note lock/unlock
+/// does NOT inherently invalidate hooks -- they survived it in live testing.)
+///
+/// The replacements are installed before the old hooks are removed, so a
+/// failure never leaves us hook-less. No messages are pumped between install
+/// and unhook, so no event is delivered twice.
+unsafe fn reinstall_hooks(kb_hook: &mut HHOOK, mouse_hook: &mut HHOOK) -> bool {
+    let new_kb = match SetWindowsHookExW(WH_KEYBOARD_LL, Some(keyboard_hook_proc), None, 0) {
+        Ok(h) => h,
+        Err(_) => return false,
+    };
+    let new_mouse = match SetWindowsHookExW(WH_MOUSE_LL, Some(mouse_hook_proc), None, 0) {
+        Ok(h) => h,
+        Err(_) => {
+            let _ = UnhookWindowsHookEx(new_kb);
+            return false;
+        }
+    };
+    let _ = UnhookWindowsHookEx(*kb_hook);
+    let _ = UnhookWindowsHookEx(*mouse_hook);
+    *kb_hook = new_kb;
+    *mouse_hook = new_mouse;
+    true
 }
 
 /// Internal listener state returned to KeyboardListener
@@ -86,7 +309,7 @@ pub(crate) fn spawn(blocking_hotkeys: Option<BlockingHotkeys>) -> Result<Windows
         let kb_hook =
             unsafe { SetWindowsHookExW(WH_KEYBOARD_LL, Some(keyboard_hook_proc), None, 0) };
 
-        let kb_hook = match kb_hook {
+        let mut kb_hook = match kb_hook {
             Ok(h) => h,
             Err(e) => {
                 eprintln!("Failed to install keyboard hook: {:?}", e);
@@ -97,7 +320,7 @@ pub(crate) fn spawn(blocking_hotkeys: Option<BlockingHotkeys>) -> Result<Windows
         // Install the low-level mouse hook
         let mouse_hook = unsafe { SetWindowsHookExW(WH_MOUSE_LL, Some(mouse_hook_proc), None, 0) };
 
-        let mouse_hook = match mouse_hook {
+        let mut mouse_hook = match mouse_hook {
             Ok(h) => h,
             Err(e) => {
                 eprintln!("Failed to install mouse hook: {:?}", e);
@@ -109,6 +332,11 @@ pub(crate) fn spawn(blocking_hotkeys: Option<BlockingHotkeys>) -> Result<Windows
             }
         };
 
+        // Watch for session changes (Win+L lock/unlock, RDP connect): the
+        // secure desktop swallows key-up events, so modifier state must be
+        // reconciled when the session comes back.
+        let session_hwnd = unsafe { create_session_notification_window() };
+
         // Message loop - required for low-level hooks to function.
         // Keep the short timeout so shutdown polling behavior remains unchanged.
         let mut msg = MSG::default();
@@ -119,8 +347,21 @@ pub(crate) fn spawn(blocking_hotkeys: Option<BlockingHotkeys>) -> Result<Windows
             }
 
             // Process all pending messages
-            if drain_thread_messages(&mut msg) {
+            let outcome = drain_thread_messages(&mut msg);
+            if outcome.quit {
                 break;
+            }
+            if outcome.session_change {
+                reconcile_modifiers_in_context();
+            }
+            if outcome.reinstall_hooks {
+                unsafe {
+                    if !reinstall_hooks(&mut kb_hook, &mut mouse_hook) {
+                        // Keep the old hooks: they usually still work (the
+                        // reinstall is defensive hardening, not a repair).
+                        eprintln!("handy-keys: failed to re-install hooks after session change");
+                    }
+                }
             }
 
             // Wait for messages or timeout — unlike thread::sleep, this returns
@@ -128,7 +369,12 @@ pub(crate) fn spawn(blocking_hotkeys: Option<BlockingHotkeys>) -> Result<Windows
             wait_for_message_or_timeout(HOOK_LOOP_TIMEOUT_MS);
         }
 
-        // Clean up the hooks
+        // Clean up the session notification window, then the hooks
+        if let Some(hwnd) = session_hwnd {
+            unsafe {
+                destroy_session_notification_window(hwnd);
+            }
+        }
         unsafe {
             let _ = UnhookWindowsHookEx(kb_hook);
             let _ = UnhookWindowsHookEx(mouse_hook);
@@ -195,17 +441,30 @@ unsafe extern "system" fn keyboard_hook_proc(code: i32, wparam: WPARAM, lparam: 
                         changed_modifier: Some(modifier),
                     });
                 }
-            } else if let Some(key) = vk_to_key(vk_code, is_extended) {
-                // Regular key event
-                should_block =
-                    should_block_hotkey(&ctx.blocking_hotkeys, ctx.current_modifiers, Some(key));
+            } else {
+                // Non-modifier key: reconcile tracked modifiers against the
+                // physical keyboard first, so a key-up missed during a secure
+                // desktop transition can't stick a modifier onto this event.
+                // (Not done for modifier events: inside a low-level hook the
+                // async key state does not yet include the in-flight change,
+                // so reconciling there would fight the toggle logic above.)
+                reconcile_modifiers(ctx);
 
-                let _ = ctx.event_sender.send(KeyEvent {
-                    modifiers: ctx.current_modifiers,
-                    key: Some(key),
-                    is_key_down,
-                    changed_modifier: None,
-                });
+                if let Some(key) = vk_to_key(vk_code, is_extended) {
+                    // Regular key event
+                    should_block = should_block_hotkey(
+                        &ctx.blocking_hotkeys,
+                        ctx.current_modifiers,
+                        Some(key),
+                    );
+
+                    let _ = ctx.event_sender.send(KeyEvent {
+                        modifiers: ctx.current_modifiers,
+                        key: Some(key),
+                        is_key_down,
+                        changed_modifier: None,
+                    });
+                }
             }
         }
     });
@@ -228,11 +487,31 @@ unsafe extern "system" fn mouse_hook_proc(code: i32, wparam: WPARAM, lparam: LPA
         return CallNextHookEx(None, code, wparam, lparam);
     }
 
+    // Only button transitions matter; bail out early for moves and wheel
+    // events so the hot path stays free of state access.
+    if !matches!(
+        wparam.0 as u32,
+        WM_LBUTTONDOWN
+            | WM_LBUTTONUP
+            | WM_RBUTTONDOWN
+            | WM_RBUTTONUP
+            | WM_MBUTTONDOWN
+            | WM_MBUTTONUP
+            | WM_XBUTTONDOWN
+            | WM_XBUTTONUP
+    ) {
+        return CallNextHookEx(None, code, wparam, lparam);
+    }
+
     // Process the mouse event
     HOOK_CONTEXT.with(|ctx_cell| {
         let mut ctx_ref = ctx_cell.borrow_mut();
         if let Some(ctx) = ctx_ref.as_mut() {
             let mouse_struct = &*(lparam.0 as *const MSLLHOOKSTRUCT);
+
+            // Stale modifiers must not gate button reporting (or decorate the
+            // event), so reconcile before reading them.
+            reconcile_modifiers(ctx);
 
             // Only report left/right clicks when modifiers are held (to avoid noise)
             let has_modifiers = !ctx.current_modifiers.is_empty();
@@ -349,7 +628,105 @@ mod tests {
             PostQuitMessage(0);
         }
         let mut msg = MSG::default();
-        assert!(drain_thread_messages(&mut msg));
+        assert!(drain_thread_messages(&mut msg).quit);
         clear_message_queue();
+    }
+
+    fn post_session_change(wparam: usize) {
+        use windows::Win32::System::Threading::GetCurrentThreadId;
+        use windows::Win32::UI::WindowsAndMessaging::PostThreadMessageW;
+        unsafe {
+            PostThreadMessageW(
+                GetCurrentThreadId(),
+                WM_WTSSESSION_CHANGE,
+                WPARAM(wparam),
+                LPARAM(0),
+            )
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn drain_reports_session_unlock_with_reinstall() {
+        clear_message_queue();
+        post_session_change(WTS_SESSION_UNLOCK);
+        let mut msg = MSG::default();
+        let outcome = drain_thread_messages(&mut msg);
+        assert!(outcome.session_change);
+        assert!(outcome.reinstall_hooks);
+        assert!(!outcome.quit);
+        clear_message_queue();
+    }
+
+    #[test]
+    fn drain_reports_session_lock_without_reinstall() {
+        clear_message_queue();
+        post_session_change(WTS_SESSION_LOCK);
+        let mut msg = MSG::default();
+        let outcome = drain_thread_messages(&mut msg);
+        assert!(outcome.session_change);
+        assert!(!outcome.reinstall_hooks);
+        clear_message_queue();
+    }
+
+    #[test]
+    fn drain_ignores_unrelated_session_events() {
+        clear_message_queue();
+        // WTS_SESSION_LOGOFF (0x6) is not a state we react to.
+        post_session_change(0x6);
+        let mut msg = MSG::default();
+        let outcome = drain_thread_messages(&mut msg);
+        assert!(!outcome.session_change);
+        assert!(!outcome.reinstall_hooks);
+        clear_message_queue();
+    }
+
+    #[test]
+    fn stale_modifiers_flags_released_keys() {
+        // Tracked Win+Ctrl, but only Ctrl still physically held: Win is stale.
+        let stale = stale_modifiers(
+            Modifiers::CMD_LEFT | Modifiers::CTRL_LEFT,
+            Modifiers::CTRL_LEFT,
+        );
+        assert_eq!(stale, Modifiers::CMD_LEFT);
+    }
+
+    #[test]
+    fn stale_modifiers_empty_when_state_matches() {
+        let tracked = Modifiers::SHIFT_LEFT | Modifiers::OPT_RIGHT;
+        assert_eq!(stale_modifiers(tracked, tracked), Modifiers::empty());
+        assert_eq!(
+            stale_modifiers(Modifiers::empty(), Modifiers::CTRL_LEFT),
+            Modifiers::empty()
+        );
+    }
+
+    #[test]
+    fn stale_modifiers_never_touches_fn() {
+        // FN is not reconcilable on Windows: never reported stale.
+        let stale = stale_modifiers(Modifiers::FN | Modifiers::CMD_LEFT, Modifiers::empty());
+        assert_eq!(stale, Modifiers::CMD_LEFT);
+    }
+
+    #[test]
+    fn release_events_shrink_modifiers_one_key_at_a_time() {
+        let tracked = Modifiers::CMD_LEFT | Modifiers::CTRL_LEFT | Modifiers::FN;
+        let stale = Modifiers::CMD_LEFT | Modifiers::CTRL_LEFT;
+        let events = release_events(tracked, stale);
+
+        assert_eq!(events.len(), 2);
+        // MODIFIER_KEYS order: CMD_LEFT before CTRL_LEFT.
+        assert_eq!(events[0].changed_modifier, Some(Modifiers::CMD_LEFT));
+        assert_eq!(events[0].modifiers, Modifiers::CTRL_LEFT | Modifiers::FN);
+        assert!(!events[0].is_key_down);
+        assert_eq!(events[0].key, None);
+        assert_eq!(events[1].changed_modifier, Some(Modifiers::CTRL_LEFT));
+        assert_eq!(events[1].modifiers, Modifiers::FN);
+        assert!(!events[1].is_key_down);
+    }
+
+    #[test]
+    fn release_events_empty_when_nothing_stale() {
+        assert!(release_events(Modifiers::CMD_LEFT, Modifiers::empty()).is_empty());
     }
 }

@@ -43,14 +43,19 @@ block2 = "0.6"
 windows = { version = "0.58", features = [
     "Win32_Foundation",
     "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_System_RemoteDesktop",
+    "Win32_Graphics_Gdi",
 ] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 rdev = { version = "0.5.3", features = ["unstable_grab"] }
 
-# Synthetic input injection for the integration tests (tests/synthetic_input.rs)
+# Synthetic input injection for the integration tests (tests/synthetic_input.rs),
+# plus GetCurrentThreadId for the session-change unit tests in the listener.
 [target.'cfg(target_os = "windows")'.dev-dependencies]
 windows = { version = "0.58", features = [
     "Win32_Foundation",
     "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_System_Threading",
 ] }
