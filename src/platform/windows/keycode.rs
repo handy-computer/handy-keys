@@ -77,6 +77,10 @@ mod vk {
     pub const F18: u16 = 0x81;
     pub const F19: u16 = 0x82;
     pub const F20: u16 = 0x83;
+    pub const F21: u16 = 0x84;
+    pub const F22: u16 = 0x85;
+    pub const F23: u16 = 0x86;
+    pub const F24: u16 = 0x87;
 
     // Left/Right modifier variants
     pub const LSHIFT: u16 = 0xA0;
@@ -102,10 +106,122 @@ mod vk {
     pub const OEM_102: u16 = 0xE2; // ISO extra key (between Left Shift and Z)
 }
 
-/// Convert Windows virtual key code to Key
+/// Scan Code Set 1 make codes for the punctuation key positions.
+///
+/// Scancodes identify the physical key position and never move with the
+/// active layout, matching macOS virtual keycodes and evdev codes (both
+/// positional). Names follow the US-layout legend for each position.
+#[allow(dead_code)]
+mod sc {
+    pub const GRAVE: u32 = 0x29; // left of 1 (US `~, UK `¬)
+    pub const MINUS: u32 = 0x0C;
+    pub const EQUAL: u32 = 0x0D;
+    pub const LEFT_BRACKET: u32 = 0x1A;
+    pub const RIGHT_BRACKET: u32 = 0x1B;
+    pub const BACKSLASH: u32 = 0x2B; // ANSI \| above Enter; ISO #~ next to Enter
+    pub const SEMICOLON: u32 = 0x27;
+    pub const QUOTE: u32 = 0x28; // right of ; (US '", UK '@)
+    pub const COMMA: u32 = 0x33;
+    pub const PERIOD: u32 = 0x34;
+    pub const SLASH: u32 = 0x35;
+    pub const ISO_SECTION: u32 = 0x56; // ISO extra key between Left Shift and Z
+    pub const LCONTROL: u32 = 0x1D;
+}
+
+/// Scancode of the phantom Left Ctrl that Windows synthesizes around every
+/// Right Alt press/release on AltGr layouts: LCtrl's make code (0x1D) with
+/// bit 9 set. Captured live on UK layout — the pair arrives with identical
+/// timestamps. Real Left Ctrl presses carry plain 0x1D.
+pub const ALTGR_PHANTOM_CTRL_SCANCODE: u32 = 0x21D;
+
+/// True for the synthetic Left Ctrl event injected by AltGr handling.
+/// These carry no user intent — the user pressed only Right Alt — so the
+/// listener drops them entirely.
+pub fn is_altgr_phantom_ctrl(vk_code: u16, scan_code: u32) -> bool {
+    vk_code == vk::LCONTROL && scan_code == ALTGR_PHANTOM_CTRL_SCANCODE
+}
+
+/// True for the VKs Windows assigns to layout-dependent punctuation keys.
+fn is_punctuation_vk(vk_code: u16) -> bool {
+    matches!(
+        vk_code,
+        vk::OEM_1
+            | vk::OEM_PLUS
+            | vk::OEM_COMMA
+            | vk::OEM_MINUS
+            | vk::OEM_PERIOD
+            | vk::OEM_2
+            | vk::OEM_3
+            | vk::OEM_4
+            | vk::OEM_5
+            | vk::OEM_6
+            | vk::OEM_7
+            | vk::OEM_8
+            | vk::OEM_102
+    )
+}
+
+/// Map a punctuation key position (Scan Code Set 1, non-extended) to a Key.
+fn punctuation_scancode_to_key(scan_code: u32) -> Option<Key> {
+    match scan_code {
+        sc::GRAVE => Some(Key::Grave),
+        sc::MINUS => Some(Key::Minus),
+        sc::EQUAL => Some(Key::Equal),
+        sc::LEFT_BRACKET => Some(Key::LeftBracket),
+        sc::RIGHT_BRACKET => Some(Key::RightBracket),
+        // The ISO #~ key (next to Enter on UK boards) shares scancode 0x2B
+        // with the ANSI \| key — they are the same logical position (macOS
+        // likewise reports both as kVK_ANSI_Backslash), so both map to
+        // Backslash.
+        sc::BACKSLASH => Some(Key::Backslash),
+        sc::SEMICOLON => Some(Key::Semicolon),
+        sc::QUOTE => Some(Key::Quote),
+        sc::COMMA => Some(Key::Comma),
+        sc::PERIOD => Some(Key::Period),
+        sc::SLASH => Some(Key::Slash),
+        sc::ISO_SECTION => Some(Key::Section),
+        _ => None,
+    }
+}
+
+/// Map a Windows keyboard event to a Key.
+///
+/// Punctuation keys are mapped from their scancode (physical position):
+/// their virtual keycodes (VK_OEM_*) move with the active layout, so e.g.
+/// on UK both the `¬ key (VK_OEM_8) and the '@ key (VK_OEM_3) would report
+/// Grave under a VK mapping, and Quote would be unreachable from the
+/// apostrophe key. Positional mapping matches what macOS virtual keycodes
+/// and evdev codes already give the other backends.
+///
+/// Everything else — letters, digits, F-keys, nav, numpad — stays on the VK
+/// mapping: those VKs are stable across layouts, and moving letters to
+/// positional mapping (e.g. AZERTY physical-Q reporting A) is a bigger
+/// behavioral decision deliberately deferred.
+///
+/// The scancode path is gated on the VK being an OEM punctuation key so a
+/// layout that places a letter on one of these positions (e.g. AZERTY M on
+/// the semicolon position) keeps reporting the letter.
+pub fn map_key(vk_code: u16, scan_code: u32, is_extended: bool) -> Option<Key> {
+    // Extended scancodes are a separate namespace (e.g. E0 35 is numpad
+    // divide, not the slash position), so only non-extended events take the
+    // positional path.
+    if !is_extended && is_punctuation_vk(vk_code) {
+        if let Some(key) = punctuation_scancode_to_key(scan_code) {
+            return Some(key);
+        }
+        // OEM VK on a position we don't know (layout put punctuation on an
+        // unusual key): fall back to the VK mapping as a best effort.
+    }
+    vk_to_key(vk_code, is_extended)
+}
+
+/// Convert Windows virtual key code to Key.
 ///
 /// The `is_extended` flag distinguishes keys like numpad Enter from main Enter.
-pub fn vk_to_key(vk_code: u16, is_extended: bool) -> Option<Key> {
+///
+/// Punctuation arms here are the US-layout interpretation, reached only as
+/// `map_key`'s fallback when the scancode position is unknown.
+fn vk_to_key(vk_code: u16, is_extended: bool) -> Option<Key> {
     match vk_code {
         // Letters A-Z (0x41-0x5A)
         0x41 => Some(Key::A),
@@ -189,6 +305,10 @@ pub fn vk_to_key(vk_code: u16, is_extended: bool) -> Option<Key> {
         vk::F18 => Some(Key::F18),
         vk::F19 => Some(Key::F19),
         vk::F20 => Some(Key::F20),
+        vk::F21 => Some(Key::F21),
+        vk::F22 => Some(Key::F22),
+        vk::F23 => Some(Key::F23),
+        vk::F24 => Some(Key::F24),
 
         // Special keys
         vk::BACK => Some(Key::Delete), // Backspace
@@ -206,7 +326,8 @@ pub fn vk_to_key(vk_code: u16, is_extended: bool) -> Option<Key> {
         vk::RIGHT => Some(Key::RightArrow),
         vk::DOWN => Some(Key::DownArrow),
 
-        // Punctuation (OEM keys - US layout)
+        // Punctuation (OEM keys - US layout interpretation; normally
+        // superseded by the positional mapping in `map_key`)
         vk::OEM_1 => Some(Key::Semicolon),
         vk::OEM_PLUS => Some(Key::Equal),
         vk::OEM_COMMA => Some(Key::Comma),
@@ -218,7 +339,7 @@ pub fn vk_to_key(vk_code: u16, is_extended: bool) -> Option<Key> {
         vk::OEM_5 => Some(Key::Backslash),
         vk::OEM_6 => Some(Key::RightBracket),
         vk::OEM_7 => Some(Key::Quote),
-        vk::OEM_8 => Some(Key::Grave),    // backtick on UK layout
+        vk::OEM_8 => Some(Key::Grave),
         vk::OEM_102 => Some(Key::Section), // ISO extra key
 
         // Lock keys
@@ -231,6 +352,9 @@ pub fn vk_to_key(vk_code: u16, is_extended: bool) -> Option<Key> {
 }
 
 /// Convert Windows virtual key code to side-specific Modifier
+///
+/// AltGr phantom Ctrl events must be filtered with `is_altgr_phantom_ctrl`
+/// before this is consulted; by VK alone they look like real Left Ctrl.
 pub fn vk_to_modifier(vk_code: u16) -> Option<Modifiers> {
     match vk_code {
         vk::LSHIFT => Some(Modifiers::SHIFT_LEFT),
@@ -245,5 +369,125 @@ pub fn vk_to_modifier(vk_code: u16) -> Option<Modifiers> {
         vk::LWIN => Some(Modifiers::CMD_LEFT),
         vk::RWIN => Some(Modifiers::CMD_RIGHT),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Punctuation keys map by physical position, whatever OEM VK the active
+    // layout assigns them. VK/scancode pairs below are as captured live
+    // (diagnostic-session-2026-07-06.md) or per the US/UK layout tables.
+
+    #[test]
+    fn grave_position_maps_to_grave_on_us_and_uk() {
+        // US `~ key: VK_OEM_3. UK `¬ key: VK_OEM_8. Same position.
+        assert_eq!(map_key(vk::OEM_3, sc::GRAVE, false), Some(Key::Grave));
+        assert_eq!(map_key(vk::OEM_8, sc::GRAVE, false), Some(Key::Grave));
+    }
+
+    #[test]
+    fn quote_position_maps_to_quote_on_us_and_uk() {
+        // US '" key: VK_OEM_7. UK '@ key: VK_OEM_3 — the VK that made both
+        // UK keys report Grave before positional mapping (cjpais/Handy#1516).
+        assert_eq!(map_key(vk::OEM_7, sc::QUOTE, false), Some(Key::Quote));
+        assert_eq!(map_key(vk::OEM_3, sc::QUOTE, false), Some(Key::Quote));
+    }
+
+    #[test]
+    fn iso_hash_key_maps_to_backslash() {
+        // UK #~ key (VK_OEM_7, next to Enter) shares position 0x2B with the
+        // ANSI \| key.
+        assert_eq!(
+            map_key(vk::OEM_7, sc::BACKSLASH, false),
+            Some(Key::Backslash)
+        );
+        assert_eq!(
+            map_key(vk::OEM_5, sc::BACKSLASH, false),
+            Some(Key::Backslash)
+        );
+    }
+
+    #[test]
+    fn remaining_punctuation_positions_map_positionally() {
+        assert_eq!(map_key(vk::OEM_MINUS, sc::MINUS, false), Some(Key::Minus));
+        assert_eq!(map_key(vk::OEM_PLUS, sc::EQUAL, false), Some(Key::Equal));
+        assert_eq!(
+            map_key(vk::OEM_4, sc::LEFT_BRACKET, false),
+            Some(Key::LeftBracket)
+        );
+        assert_eq!(
+            map_key(vk::OEM_6, sc::RIGHT_BRACKET, false),
+            Some(Key::RightBracket)
+        );
+        assert_eq!(
+            map_key(vk::OEM_1, sc::SEMICOLON, false),
+            Some(Key::Semicolon)
+        );
+        assert_eq!(map_key(vk::OEM_COMMA, sc::COMMA, false), Some(Key::Comma));
+        assert_eq!(
+            map_key(vk::OEM_PERIOD, sc::PERIOD, false),
+            Some(Key::Period)
+        );
+        assert_eq!(map_key(vk::OEM_2, sc::SLASH, false), Some(Key::Slash));
+        assert_eq!(
+            map_key(vk::OEM_102, sc::ISO_SECTION, false),
+            Some(Key::Section)
+        );
+    }
+
+    #[test]
+    fn letters_stay_on_vk_mapping_even_on_punctuation_positions() {
+        // AZERTY puts M on the semicolon position: it must stay M.
+        assert_eq!(map_key(0x4D, sc::SEMICOLON, false), Some(Key::M));
+        // German QWERTZ puts Z on the US Y position; letter VKs win.
+        assert_eq!(map_key(0x5A, 0x15, false), Some(Key::Z));
+    }
+
+    #[test]
+    fn oem_vk_on_unknown_position_falls_back_to_vk_mapping() {
+        // A layout placing punctuation on a position outside the table (e.g.
+        // Hungarian ö on the 0 key, scancode 0x0B) uses the US VK reading.
+        assert_eq!(map_key(vk::OEM_1, 0x0B, false), Some(Key::Semicolon));
+    }
+
+    #[test]
+    fn extended_events_skip_the_positional_table() {
+        // E0-prefixed scancodes are a different namespace; an extended event
+        // must not be misread as a punctuation position.
+        assert_eq!(map_key(vk::OEM_2, sc::SLASH, true), Some(Key::Slash));
+        // Numpad divide (VK_DIVIDE, E0 35) is not an OEM VK at all.
+        assert_eq!(
+            map_key(vk::DIVIDE, sc::SLASH, true),
+            Some(Key::KeypadDivide)
+        );
+    }
+
+    #[test]
+    fn f21_to_f24_map() {
+        assert_eq!(map_key(vk::F21, 0, false), Some(Key::F21));
+        assert_eq!(map_key(vk::F22, 0, false), Some(Key::F22));
+        assert_eq!(map_key(vk::F23, 0, false), Some(Key::F23));
+        assert_eq!(map_key(vk::F24, 0, false), Some(Key::F24));
+    }
+
+    #[test]
+    fn altgr_phantom_ctrl_is_detected() {
+        assert!(is_altgr_phantom_ctrl(
+            vk::LCONTROL,
+            ALTGR_PHANTOM_CTRL_SCANCODE
+        ));
+    }
+
+    #[test]
+    fn real_ctrl_events_are_not_phantom() {
+        // Real Left Ctrl: plain make code, no bit 9.
+        assert!(!is_altgr_phantom_ctrl(vk::LCONTROL, sc::LCONTROL));
+        // Right Ctrl never participates in AltGr synthesis.
+        assert!(!is_altgr_phantom_ctrl(
+            vk::RCONTROL,
+            ALTGR_PHANTOM_CTRL_SCANCODE
+        ));
     }
 }

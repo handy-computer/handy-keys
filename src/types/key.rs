@@ -71,6 +71,12 @@ pub enum Key {
     F18,
     F19,
     F20,
+    /// F21–F24 exist on Windows (VK 0x84–0x87) and in evdev; macOS virtual
+    /// keycodes stop at F20, so these are unreachable from macOS hardware.
+    F21,
+    F22,
+    F23,
+    F24,
 
     // Special keys
     Space,
@@ -219,6 +225,10 @@ impl fmt::Display for Key {
             Key::F18 => write!(f, "F18"),
             Key::F19 => write!(f, "F19"),
             Key::F20 => write!(f, "F20"),
+            Key::F21 => write!(f, "F21"),
+            Key::F22 => write!(f, "F22"),
+            Key::F23 => write!(f, "F23"),
+            Key::F24 => write!(f, "F24"),
             Key::Space => write!(f, "Space"),
             Key::Return => write!(f, "Return"),
             Key::Tab => write!(f, "Tab"),
@@ -350,6 +360,10 @@ impl FromStr for Key {
             "f18" => Ok(Key::F18),
             "f19" => Ok(Key::F19),
             "f20" => Ok(Key::F20),
+            "f21" => Ok(Key::F21),
+            "f22" => Ok(Key::F22),
+            "f23" => Ok(Key::F23),
+            "f24" => Ok(Key::F24),
 
             // Special keys
             "space" | " " => Ok(Key::Space),
@@ -454,6 +468,8 @@ mod tests {
         assert_eq!("F1".parse::<Key>().unwrap(), Key::F1);
         assert_eq!("f12".parse::<Key>().unwrap(), Key::F12);
         assert_eq!("F20".parse::<Key>().unwrap(), Key::F20);
+        assert_eq!("f21".parse::<Key>().unwrap(), Key::F21);
+        assert_eq!("F24".parse::<Key>().unwrap(), Key::F24);
     }
 
     #[test]
@@ -504,6 +520,10 @@ mod tests {
             Key::Num9,
             Key::F1,
             Key::F12,
+            Key::F21,
+            Key::F22,
+            Key::F23,
+            Key::F24,
             Key::Space,
             Key::Return,
             Key::Tab,
