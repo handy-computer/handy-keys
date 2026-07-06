@@ -171,6 +171,14 @@ fn release_events(tracked: Modifiers, stale: Modifiers) -> Vec<KeyEvent> {
 /// Stale modifiers are cleared with synthetic release events so consumers
 /// tracking press/release state recover; missed presses are adopted silently
 /// and ride along on the next real event.
+///
+/// Known micro-race: GetAsyncKeyState reads the state *now*, not at the time
+/// the event being processed was generated, so a modifier pressed in the
+/// sub-millisecond window between a keystroke entering the queue and its hook
+/// callback running gets adopted onto that earlier keystroke's event. It is
+/// self-correcting (the modifier's own event arrives right after) and
+/// unavoidable with this API — macOS avoids it because CGEvent flags are
+/// stamped per event.
 fn reconcile_modifiers(ctx: &mut HookContext) {
     let physical = physical_modifiers();
     for event in release_events(
@@ -193,15 +201,30 @@ fn reconcile_modifiers_in_context() {
     });
 }
 
-/// Pass-through wndproc for the session notification window. (The `windows`
-/// crate's DefWindowProcW is a generic Rust wrapper, so it cannot be used as
+/// Wndproc for the session notification window. (The `windows` crate's
+/// DefWindowProcW is a generic Rust wrapper, so it cannot be used as
 /// lpfnWndProc directly.)
+///
+/// Reconciles here as well as in the drain loop: the drain loop covers posted
+/// delivery of WM_WTSSESSION_CHANGE (what Windows 11 26200 does, verified
+/// live), while this path covers builds that deliver it via SendMessage,
+/// which bypasses the message queue. Double reconciliation on the posted path
+/// is harmless — the second pass finds nothing stale. Hook reinstall stays
+/// loop-driven; it is defensive hardening, while the state reset is the fix.
 unsafe extern "system" fn session_wndproc(
     hwnd: HWND,
     msg: u32,
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> LRESULT {
+    if msg == WM_WTSSESSION_CHANGE {
+        match wparam.0 {
+            WTS_SESSION_LOCK | WTS_SESSION_UNLOCK | WTS_CONSOLE_CONNECT | WTS_REMOTE_CONNECT => {
+                reconcile_modifiers_in_context();
+            }
+            _ => {}
+        }
+    }
     DefWindowProcW(hwnd, msg, wparam, lparam)
 }
 
