@@ -17,18 +17,17 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 use windows::Win32::UI::WindowsAndMessaging::{
     CallNextHookEx, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
     MsgWaitForMultipleObjects, PeekMessageW, RegisterClassW, SetWindowsHookExW, TranslateMessage,
-    UnhookWindowsHookEx, HHOOK, HWND_MESSAGE, KBDLLHOOKSTRUCT, LLKHF_EXTENDED, MSG,
-    MSLLHOOKSTRUCT, PM_REMOVE, QS_ALLINPUT, WH_KEYBOARD_LL, WH_MOUSE_LL, WINDOW_EX_STYLE,
-    WINDOW_STYLE, WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP,
-    WM_QUIT, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SYSKEYDOWN, WM_XBUTTONDOWN, WM_XBUTTONUP,
-    WNDCLASSW,
+    UnhookWindowsHookEx, HHOOK, HWND_MESSAGE, KBDLLHOOKSTRUCT, LLKHF_EXTENDED, MSG, MSLLHOOKSTRUCT,
+    PM_REMOVE, QS_ALLINPUT, WH_KEYBOARD_LL, WH_MOUSE_LL, WINDOW_EX_STYLE, WINDOW_STYLE, WM_KEYDOWN,
+    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_QUIT, WM_RBUTTONDOWN,
+    WM_RBUTTONUP, WM_SYSKEYDOWN, WM_XBUTTONDOWN, WM_XBUTTONUP, WNDCLASSW,
 };
 
 use crate::error::Result;
 use crate::platform::state::BlockingHotkeys;
 use crate::types::{Key, KeyEvent, Modifiers};
 
-use super::keycode::{vk_to_key, vk_to_modifier};
+use super::keycode::{is_altgr_phantom_ctrl, map_key, vk_to_modifier};
 
 const HOOK_LOOP_TIMEOUT_MS: u32 = 10;
 
@@ -68,6 +67,10 @@ struct HookContext {
     event_sender: Sender<KeyEvent>,
     current_modifiers: Modifiers,
     blocking_hotkeys: Option<BlockingHotkeys>,
+    /// AltGr's phantom Left Ctrl is currently held. The hook drops the
+    /// phantom's own events, but GetAsyncKeyState still reports LCtrl as
+    /// down while AltGr is held, so reconciliation must not adopt it.
+    altgr_phantom_ctrl: bool,
 }
 
 thread_local! {
@@ -141,6 +144,24 @@ fn stale_modifiers(tracked: Modifiers, physical: Modifiers) -> Modifiers {
     (tracked & RECONCILABLE) & !physical
 }
 
+/// Physically-held modifiers we missed the press of and should adopt.
+///
+/// While AltGr's phantom Left Ctrl is held, CTRL_LEFT is excluded: it is
+/// physically down per GetAsyncKeyState, but the user only pressed Right
+/// Alt. A real Left Ctrl press during that window still sets CTRL_LEFT
+/// through its own hook event (which carries a non-phantom scancode).
+fn adoptable_modifiers(
+    tracked: Modifiers,
+    physical: Modifiers,
+    altgr_phantom_ctrl: bool,
+) -> Modifiers {
+    let mut adopt = physical & RECONCILABLE & !tracked;
+    if altgr_phantom_ctrl {
+        adopt &= !Modifiers::CTRL_LEFT;
+    }
+    adopt
+}
+
 /// Build the synthetic release events that clear `stale` from `tracked`, in
 /// MODIFIER_KEYS order. Each event carries the modifier set as it shrinks,
 /// exactly as if the keys had been released one by one.
@@ -181,6 +202,13 @@ fn release_events(tracked: Modifiers, stale: Modifiers) -> Vec<KeyEvent> {
 /// stamped per event.
 fn reconcile_modifiers(ctx: &mut HookContext) {
     let physical = physical_modifiers();
+    // Phantom Ctrl only exists while AltGr is held; if LCtrl reads as up,
+    // the phantom is gone (covers a phantom key-up swallowed by a secure
+    // desktop transition, which would otherwise suppress CTRL_LEFT adoption
+    // forever).
+    if ctx.altgr_phantom_ctrl && !physical.contains(Modifiers::CTRL_LEFT) {
+        ctx.altgr_phantom_ctrl = false;
+    }
     for event in release_events(
         ctx.current_modifiers,
         stale_modifiers(ctx.current_modifiers, physical),
@@ -188,7 +216,8 @@ fn reconcile_modifiers(ctx: &mut HookContext) {
         ctx.current_modifiers = event.modifiers;
         let _ = ctx.event_sender.send(event);
     }
-    ctx.current_modifiers |= physical & RECONCILABLE & !ctx.current_modifiers;
+    ctx.current_modifiers |=
+        adoptable_modifiers(ctx.current_modifiers, physical, ctx.altgr_phantom_ctrl);
 }
 
 /// Reconcile modifier state from the hook thread's message loop (used on
@@ -325,6 +354,7 @@ pub(crate) fn spawn(blocking_hotkeys: Option<BlockingHotkeys>) -> Result<Windows
                 event_sender: tx,
                 current_modifiers: Modifiers::empty(),
                 blocking_hotkeys: thread_blocking,
+                altgr_phantom_ctrl: false,
             });
         });
 
@@ -436,9 +466,20 @@ unsafe extern "system" fn keyboard_hook_proc(code: i32, wparam: WPARAM, lparam: 
             // Extract key information from KBDLLHOOKSTRUCT
             let kb_struct = &*(lparam.0 as *const KBDLLHOOKSTRUCT);
             let vk_code = kb_struct.vkCode as u16;
+            let scan_code = kb_struct.scanCode;
             let is_extended = (kb_struct.flags.0 & LLKHF_EXTENDED.0) != 0;
 
             let is_key_down = matches!(wparam.0 as u32, WM_KEYDOWN | WM_SYSKEYDOWN);
+
+            // On AltGr layouts Windows synthesizes a Left Ctrl press/release
+            // around every Right Alt event (captured live on UK layout:
+            // identical timestamps, scancode 0x21D). Drop it entirely — no
+            // modifier update, no emit — so AltGr+key reads as OptRight
+            // only. The event is still passed down the hook chain.
+            if is_altgr_phantom_ctrl(vk_code, scan_code) {
+                ctx.altgr_phantom_ctrl = is_key_down;
+                return;
+            }
 
             // Check if this is a modifier key
             if let Some(modifier) = vk_to_modifier(vk_code) {
@@ -473,7 +514,7 @@ unsafe extern "system" fn keyboard_hook_proc(code: i32, wparam: WPARAM, lparam: 
                 // so reconciling there would fight the toggle logic above.)
                 reconcile_modifiers(ctx);
 
-                if let Some(key) = vk_to_key(vk_code, is_extended) {
+                if let Some(key) = map_key(vk_code, scan_code, is_extended) {
                     // Regular key event
                     should_block = should_block_hotkey(
                         &ctx.blocking_hotkeys,
@@ -751,5 +792,53 @@ mod tests {
     #[test]
     fn release_events_empty_when_nothing_stale() {
         assert!(release_events(Modifiers::CMD_LEFT, Modifiers::empty()).is_empty());
+    }
+
+    #[test]
+    fn adoption_picks_up_missed_presses() {
+        let adopt = adoptable_modifiers(
+            Modifiers::CTRL_LEFT,
+            Modifiers::CTRL_LEFT | Modifiers::SHIFT_LEFT,
+            false,
+        );
+        assert_eq!(adopt, Modifiers::SHIFT_LEFT);
+    }
+
+    #[test]
+    fn adoption_skips_ctrl_left_while_altgr_phantom_held() {
+        // AltGr held: GetAsyncKeyState reports LCtrl+RAlt down, but only
+        // OptRight reflects a user keypress. CTRL_LEFT must not be adopted.
+        let adopt = adoptable_modifiers(
+            Modifiers::OPT_RIGHT,
+            Modifiers::CTRL_LEFT | Modifiers::OPT_RIGHT,
+            true,
+        );
+        assert_eq!(adopt, Modifiers::empty());
+    }
+
+    #[test]
+    fn adoption_keeps_other_modifiers_while_altgr_phantom_held() {
+        // A genuinely-held Shift missed during a secure desktop transition
+        // is still adopted while the phantom flag is set.
+        let adopt = adoptable_modifiers(
+            Modifiers::OPT_RIGHT,
+            Modifiers::CTRL_LEFT | Modifiers::OPT_RIGHT | Modifiers::SHIFT_LEFT,
+            true,
+        );
+        assert_eq!(adopt, Modifiers::SHIFT_LEFT);
+    }
+
+    #[test]
+    fn phantom_flag_never_releases_a_tracked_ctrl() {
+        // User really holds LCtrl, then AltGr: CTRL_LEFT is tracked from its
+        // own event and physically down, so it must be neither stale nor
+        // re-adopted.
+        let tracked = Modifiers::CTRL_LEFT | Modifiers::OPT_RIGHT;
+        let physical = Modifiers::CTRL_LEFT | Modifiers::OPT_RIGHT;
+        assert_eq!(stale_modifiers(tracked, physical), Modifiers::empty());
+        assert_eq!(
+            adoptable_modifiers(tracked, physical, true),
+            Modifiers::empty()
+        );
     }
 }

@@ -19,9 +19,11 @@
 //! indistinguishable from hardware at the evdev layer) lands together with
 //! the in-tree evdev backend that replaces rdev.
 //!
-//! All injections use F20: it exists in the `Key` enum on both platforms
-//! and does nothing in terminals or the desktop environment, so a test run
-//! never types into or otherwise disturbs the session it runs in.
+//! Injections must never type into or otherwise disturb the session the
+//! tests run in: key-down/key-up pairs use F20 (exists in the `Key` enum on
+//! both platforms, does nothing in terminals or the desktop environment);
+//! keys that would type a character are injected as lone key-ups, which the
+//! low-level hook still observes but which generate no character.
 
 #![cfg(any(target_os = "macos", target_os = "windows"))]
 
@@ -93,7 +95,7 @@ mod windows_tests {
     use super::*;
     use windows::Win32::UI::Input::KeyboardAndMouse::{
         SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYBD_EVENT_FLAGS, KEYEVENTF_KEYUP,
-        VK_F20,
+        KEYEVENTF_SCANCODE, VIRTUAL_KEY, VK_F20,
     };
 
     fn send_f20(key_up: bool) {
@@ -135,6 +137,59 @@ mod windows_tests {
         assert!(
             saw_key_event(&listener, Key::F20, false, Duration::from_secs(2)),
             "did not observe injected F20 key-up"
+        );
+    }
+
+    /// Inject a key-up by scancode only (wVk = 0, KEYEVENTF_SCANCODE):
+    /// Windows translates the scancode to a VK using the active layout,
+    /// exactly as a hardware key release would arrive at the hook. A lone
+    /// key-up generates no character, so nothing is typed into the session.
+    fn send_scancode_key_up(scan: u16) {
+        let input = INPUT {
+            r#type: INPUT_KEYBOARD,
+            Anonymous: INPUT_0 {
+                ki: KEYBDINPUT {
+                    wVk: VIRTUAL_KEY(0),
+                    wScan: scan,
+                    dwFlags: KEYEVENTF_SCANCODE | KEYEVENTF_KEYUP,
+                    time: 0,
+                    dwExtraInfo: 0,
+                },
+            },
+        };
+        let sent = unsafe { SendInput(&[input], std::mem::size_of::<INPUT>() as i32) };
+        assert_eq!(sent, 1, "SendInput failed");
+    }
+
+    /// The grave and quote key *positions* must map to Grave and Quote no
+    /// matter which VK the active layout assigns them (cjpais/Handy#1516:
+    /// on UK, the apostrophe key sends VK_OEM_3 and used to report Grave).
+    ///
+    /// Windows translates the injected scancode through the active layout,
+    /// so this test proves layout independence when run under any layout
+    /// (verified live under both US and UK on the original dev machine).
+    /// It does not switch layouts itself: programmatic switching would
+    /// perturb the interactive session the test runs in and requires the
+    /// other layout to be installed, so it asserts per-scancode instead.
+    #[test]
+    #[ignore = "needs an interactive desktop session; run: cargo test --test synthetic_input -- --ignored"]
+    fn punctuation_scancodes_map_positionally() {
+        const SC_GRAVE: u16 = 0x29; // left of 1 (US `~, UK `¬)
+        const SC_QUOTE: u16 = 0x28; // right of ; (US '", UK '@)
+
+        let listener = KeyboardListener::new().expect("failed to spawn keyboard listener");
+        std::thread::sleep(Duration::from_millis(200));
+
+        send_scancode_key_up(SC_GRAVE);
+        assert!(
+            saw_key_event(&listener, Key::Grave, false, Duration::from_secs(2)),
+            "grave-position scancode 0x29 did not map to Key::Grave"
+        );
+
+        send_scancode_key_up(SC_QUOTE);
+        assert!(
+            saw_key_event(&listener, Key::Quote, false, Duration::from_secs(2)),
+            "quote-position scancode 0x28 did not map to Key::Quote"
         );
     }
 }
