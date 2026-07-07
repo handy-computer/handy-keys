@@ -26,6 +26,10 @@ path = "examples/record_hotkey.rs"
 name = "diagnostic"
 path = "examples/diagnostic.rs"
 
+[[example]]
+name = "blocking_diagnostic"
+path = "examples/blocking_diagnostic.rs"
+
 [dependencies]
 bitflags = { version = "2", features = ["serde"] }
 serde = { version = "1", features = ["derive"] }
