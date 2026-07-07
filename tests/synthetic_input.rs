@@ -256,6 +256,118 @@ mod linux {
         );
     }
 
+    fn count_event_nodes() -> usize {
+        std::fs::read_dir("/dev/input")
+            .expect("cannot read /dev/input")
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().starts_with("event"))
+            .count()
+    }
+
+    /// Two blocking listeners must not grab each other's re-injection
+    /// clones: doing so would mint new uinput devices in an unbounded
+    /// loop. The second blocker degrades to detect-only behind the first.
+    #[test]
+    #[ignore = "needs /dev/input + /dev/uinput access; run: cargo test --test synthetic_input -- --ignored"]
+    fn two_blocking_listeners_do_not_multiply_devices() {
+        let _serial = SERIAL.lock().unwrap();
+        let mut keyboard = virtual_keyboard();
+        sleep(DEVICE_SETTLE);
+
+        let first_hotkeys: BlockingHotkeys = Arc::new(Mutex::new(HashSet::from(["f20"
+            .parse::<Hotkey>()
+            .unwrap()])));
+        let _first = KeyboardListener::new_with_blocking(first_hotkeys)
+            .expect("first blocking listener failed to spawn");
+        sleep(DEVICE_SETTLE);
+        let baseline = count_event_nodes();
+
+        let second_hotkeys: BlockingHotkeys = Arc::new(Mutex::new(HashSet::from(["f20"
+            .parse::<Hotkey>()
+            .unwrap()])));
+        let _second = KeyboardListener::new_with_blocking(second_hotkeys)
+            .expect("second blocking listener failed to spawn");
+        sleep(DEVICE_SETTLE);
+
+        // Stir the pipeline; a clone storm feeds on device activity too.
+        emit_key(&mut keyboard, KeyCode::KEY_F20, true);
+        emit_key(&mut keyboard, KeyCode::KEY_F20, false);
+
+        let sample_one = count_event_nodes();
+        sleep(Duration::from_millis(1500));
+        let sample_two = count_event_nodes();
+
+        assert_eq!(
+            sample_one, sample_two,
+            "device count still changing — clone storm between blocking listeners"
+        );
+        assert!(
+            sample_two <= baseline + 1,
+            "second blocking listener created clones it should not have \
+             (baseline {baseline}, now {sample_two})"
+        );
+    }
+
+    /// A keyboard with keys physically held at spawn must not be grabbed
+    /// until it goes quiet: grabbing mid-press splits the press/release
+    /// pair across two devices and wedges the key at the compositor.
+    #[test]
+    #[ignore = "needs /dev/input + /dev/uinput access; run: cargo test --test synthetic_input -- --ignored"]
+    fn grab_is_deferred_while_keys_are_held() {
+        use evdev::raw_stream::RawDevice;
+
+        let _serial = SERIAL.lock().unwrap();
+        let mut keyboard = virtual_keyboard();
+        sleep(DEVICE_SETTLE);
+        let node = keyboard
+            .enumerate_dev_nodes_blocking()
+            .expect("cannot enumerate virtual keyboard nodes")
+            .find_map(|n| n.ok())
+            .expect("virtual keyboard has no device node");
+
+        // Hold F20 across the blocking listener's spawn.
+        emit_key(&mut keyboard, KeyCode::KEY_F20, true);
+        sleep(Duration::from_millis(200));
+
+        let hotkeys: BlockingHotkeys = Arc::new(Mutex::new(HashSet::from(["f20"
+            .parse::<Hotkey>()
+            .unwrap()])));
+        let blocker = KeyboardListener::new_with_blocking(hotkeys)
+            .expect("blocking listener failed to spawn");
+        sleep(Duration::from_millis(300));
+
+        // While the key is held, the device must still be grabbable by us —
+        // i.e. the listener deferred its grab.
+        {
+            let mut probe = RawDevice::open(&node).expect("cannot open virtual keyboard node");
+            probe
+                .grab()
+                .expect("device was grabbed while a key was held — grab was not deferred");
+            probe.ungrab().expect("probe ungrab failed");
+        }
+
+        // Release → device quiet → the listener finishes the grab.
+        emit_key(&mut keyboard, KeyCode::KEY_F20, false);
+        sleep(Duration::from_millis(500));
+        {
+            let mut probe = RawDevice::open(&node).expect("cannot open virtual keyboard node");
+            assert!(
+                probe.grab().is_err(),
+                "device still not grabbed after all keys were released"
+            );
+        }
+
+        // And the completed grab actually blocks: drain the events observed
+        // so far, then verify a fresh press still reaches the listener.
+        while blocker.try_recv().is_some() {}
+        emit_key(&mut keyboard, KeyCode::KEY_F20, true);
+        assert!(
+            saw_key_event(&blocker, Key::F20, true, Duration::from_secs(2)),
+            "listener stopped seeing events after the deferred grab completed"
+        );
+        emit_key(&mut keyboard, KeyCode::KEY_F20, false);
+    }
+
     #[test]
     #[ignore = "needs /dev/input + /dev/uinput access; run: cargo test --test synthetic_input -- --ignored"]
     fn modifiers_ride_on_injected_keys() {

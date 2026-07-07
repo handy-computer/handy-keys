@@ -90,6 +90,10 @@ non-blocking listener only needs `/dev/input` read access. Pointer devices are
 never grabbed, so mouse-button hotkeys are detected but not blocked (matching
 Windows).
 
+Run at most one blocking listener per system: the first one owns the exclusive
+grabs, and any further blocking listener (in the same process or another)
+detects hotkeys but cannot block them.
+
 ## Modifiers
 
 | Modifier | Aliases |

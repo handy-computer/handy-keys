@@ -19,9 +19,13 @@
 //!
 //! Each listener tracks the device nodes of its own uinput clones and
 //! filters exactly those from its enumeration (reading one's own output
-//! would loop); other listeners — including in other processes — see the
-//! clones as ordinary keyboards, so stacked instances chain instead of
-//! poisoning each other.
+//! would loop). Other listeners — including in other processes — read the
+//! clones like ordinary keyboards, so a listener stacked behind a blocking
+//! one still sees every non-blocked event. Blocking listeners, however,
+//! never *grab* each other's clones (recognized by name prefix): two
+//! blockers cloning each other's clones would mint new uinput devices
+//! without bound. First blocker wins; later ones detect but cannot block
+//! what it already grabbed.
 //!
 //! # Modifier-state recovery
 //!
@@ -83,6 +87,11 @@ const MODIFIER_KEYS: [(KeyCode, Modifiers); 8] = [
 ];
 
 // Key event values from the kernel input protocol.
+/// Name prefix of the uinput re-injection clones. Doubles as the marker by
+/// which blocking listeners recognize each other's outputs and refuse to
+/// grab them (see `is_passthrough_clone`).
+const CLONE_NAME_PREFIX: &str = "handy-keys passthrough: ";
+
 const KEY_RELEASED: i32 = 0;
 const KEY_PRESSED: i32 = 1;
 const KEY_AUTOREPEAT: i32 = 2;
@@ -127,6 +136,13 @@ struct OpenDevice {
     /// The clone's /dev/input nodes, held to unregister them from
     /// `GrabConfig::own_outputs` when this device is removed.
     output_nodes: Vec<PathBuf>,
+    /// This keyboard should be grabbed, but keys were physically held when
+    /// it was opened. Grabbing mid-press would split the press/release pair
+    /// across two devices and wedge the key at the compositor (libinput
+    /// discards unbalanced key-ups), so the device stays read-only until
+    /// EVIOCGKEY reports it quiet — the pending release itself wakes the
+    /// poll loop, and the grab completes then.
+    pending_grab: bool,
     /// Events of the in-flight batch, forwarded to `output` as one unit on
     /// SYN_REPORT so batching is preserved. Unused when not grabbed.
     pending: Vec<InputEvent>,
@@ -249,16 +265,18 @@ fn is_event_node(path: &Path) -> bool {
 /// we can map, or if it is one of this listener's own uinput clones.
 ///
 /// In blocking mode, keyboards are additionally grabbed with a uinput
-/// clone attached; a failed grab (e.g. another exclusive grabber like keyd
-/// got there first) degrades that device to read-only with a warning, so
-/// hotkey detection keeps working.
+/// clone attached — immediately if the device is quiet, deferred until
+/// its keys are released otherwise (see `OpenDevice::pending_grab`). A
+/// failed grab (e.g. another exclusive grabber like keyd got there first)
+/// degrades that device to read-only with a warning, so hotkey detection
+/// keeps working.
 fn open_device(path: &Path, grab: &mut Option<GrabConfig>) -> io::Result<Option<OpenDevice>> {
     if let Some(cfg) = grab {
         if cfg.own_outputs.contains(path) {
             return Ok(None); // our own clone: reading it back would loop
         }
     }
-    let mut dev = RawDevice::open(path)?;
+    let dev = RawDevice::open(path)?;
     if !is_capturable(&dev) {
         return Ok(None);
     }
@@ -266,32 +284,82 @@ fn open_device(path: &Path, grab: &mut Option<GrabConfig>) -> io::Result<Option<
     // without ever sleeping inside a read.
     set_nonblocking(dev.as_raw_fd())?;
 
-    let (output, output_nodes) = match grab {
-        Some(cfg) if is_keyboard(&dev) => match grab_with_output(&mut dev) {
-            Ok((output, nodes)) => {
-                cfg.own_outputs.extend(nodes.iter().cloned());
-                (Some(output), nodes)
-            }
-            Err(e) => {
-                eprintln!(
-                    "handy-keys: cannot grab {} for hotkey blocking ({e}); its hotkeys will be \
-                     detected but not blocked",
-                    path.display()
-                );
-                (None, Vec::new())
-            }
-        },
-        _ => (None, Vec::new()),
-    };
-
-    Ok(Some(OpenDevice {
+    let mut device = OpenDevice {
         path: path.to_path_buf(),
         dev,
         resyncing: false,
-        output,
-        output_nodes,
+        output: None,
+        output_nodes: Vec::new(),
+        pending_grab: false,
         pending: Vec::new(),
-    }))
+    };
+
+    if let Some(cfg) = grab {
+        if is_passthrough_clone(&device.dev) {
+            // Another blocking listener's re-injection output. Reading it
+            // gives us its keyboard's (non-blocked) events; grabbing it
+            // would make that listener see OUR clone as a new keyboard and
+            // clone it back — an unbounded device storm. First blocker
+            // wins; we detect but cannot block behind it.
+            eprintln!(
+                "handy-keys: {} is another handy-keys blocking listener's output; its hotkeys \
+                 will be detected but not blocked by this listener",
+                path.display()
+            );
+        } else if is_keyboard(&device.dev) {
+            if keys_held(&device.dev) {
+                device.pending_grab = true; // grab at first quiet moment
+            } else {
+                complete_grab(&mut device, cfg);
+            }
+        } else if has_keyboard_keys(&device.dev) {
+            // Combo device exposing keyboard keys on a pointer node: the
+            // no-grabbing-pointers rule wins, but say so — "why isn't my
+            // hotkey blocked" is undebuggable otherwise.
+            eprintln!(
+                "handy-keys: {} exposes keyboard keys on a pointer device; its hotkeys will be \
+                 detected but not blocked (pointer devices are never grabbed)",
+                path.display()
+            );
+        }
+    }
+
+    Ok(Some(device))
+}
+
+/// Attempt the exclusive grab + clone for a keyboard, degrading to
+/// read-only with a warning on failure. Clears `pending_grab` either way —
+/// a refused grab (EBUSY from another grabber) won't heal by retrying.
+fn complete_grab(device: &mut OpenDevice, cfg: &mut GrabConfig) {
+    device.pending_grab = false;
+    match grab_with_output(&mut device.dev) {
+        Ok((output, nodes)) => {
+            cfg.own_outputs.extend(nodes.iter().cloned());
+            device.output = Some(output);
+            device.output_nodes = nodes;
+        }
+        Err(e) => {
+            eprintln!(
+                "handy-keys: cannot grab {} for hotkey blocking ({e}); its hotkeys will be \
+                 detected but not blocked",
+                device.path.display()
+            );
+        }
+    }
+}
+
+/// Whether any key is physically held on the device right now (EVIOCGKEY).
+fn keys_held(dev: &RawDevice) -> bool {
+    dev.get_key_state()
+        .map(|keys| keys.iter().next().is_some())
+        .unwrap_or(false)
+}
+
+/// Whether this device is a re-injection clone created by a handy-keys
+/// blocking listener (this process or another).
+fn is_passthrough_clone(dev: &RawDevice) -> bool {
+    dev.name()
+        .is_some_and(|name| name.starts_with(CLONE_NAME_PREFIX))
 }
 
 /// A device is worth reading iff it can emit at least one key or button we
@@ -321,9 +389,11 @@ fn is_keyboard(dev: &RawDevice) -> bool {
         || dev
             .supported_absolute_axes()
             .is_some_and(|axes| axes.contains(AbsoluteAxisCode::ABS_X));
-    if is_pointer {
-        return false;
-    }
+    !is_pointer && has_keyboard_keys(dev)
+}
+
+/// Whether the device can emit at least one mappable non-mouse key.
+fn has_keyboard_keys(dev: &RawDevice) -> bool {
     dev.supported_keys().is_some_and(|keys| {
         keys.iter().any(|code| {
             key_code_to_modifier(code).is_some()
@@ -344,10 +414,7 @@ fn is_keyboard(dev: &RawDevice) -> bool {
 /// Grab a keyboard exclusively and create the uinput clone that carries
 /// its non-blocked events onward to the rest of the system.
 fn grab_with_output(dev: &mut RawDevice) -> io::Result<(VirtualDevice, Vec<PathBuf>)> {
-    let name = format!(
-        "handy-keys passthrough: {}",
-        dev.name().unwrap_or("keyboard")
-    );
+    let name = format!("{CLONE_NAME_PREFIX}{}", dev.name().unwrap_or("keyboard"));
 
     let mut builder = VirtualDevice::builder()?
         .name(name.as_str())
@@ -370,11 +437,33 @@ fn grab_with_output(dev: &mut RawDevice) -> io::Result<(VirtualDevice, Vec<PathB
         .filter_map(|node| node.ok())
         .collect();
 
+    // The kernel has queued events on our fd since open(), but until the
+    // grab lands the compositor received them too — forwarding them would
+    // deliver every pre-grab keystroke twice. Discard them (modifier state
+    // is seeded from EVIOCGKEY, not from these events); only what arrives
+    // after the grab is exclusively ours to re-inject.
+    discard_pending_events(dev)?;
+
     // Grab only after the clone exists, so there is never a moment where
-    // keystrokes are swallowed with nowhere to go. (Events arriving before
-    // the first poll wait in the kernel buffer and are forwarded then.)
+    // keystrokes are swallowed with nowhere to go.
     dev.grab()?;
     Ok((output, nodes))
+}
+
+/// Drain and discard everything queued on a (non-blocking) device fd.
+fn discard_pending_events(dev: &mut RawDevice) -> io::Result<()> {
+    loop {
+        match dev.fetch_events() {
+            Ok(events) => {
+                if events.count() == 0 {
+                    return Ok(());
+                }
+            }
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => return Ok(()),
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        }
+    }
 }
 
 fn set_nonblocking(fd: RawFd) -> io::Result<()> {
@@ -418,6 +507,11 @@ fn reconcile_modifiers(state: &mut LinuxState, physical: Modifiers) {
         let _ = state.listener.event_sender.send(event);
     }
     state.listener.current_modifiers |= physical & RECONCILABLE & !state.listener.current_modifiers;
+    // A modifier no longer physically held anywhere can't produce a
+    // release event that would need blocking; drop its stale blocked bit
+    // (e.g. left by a keyboard unplugged mid-hold) so a later forwarded
+    // press on another keyboard is never paired with a blocked release.
+    state.blocked_modifiers &= physical;
 }
 
 /// The poll loop: one pollfd per device plus the inotify watch, re-checking
@@ -480,7 +574,7 @@ fn run_loop(
             if pollfd.revents & libc::POLLIN == 0 {
                 continue;
             }
-            match drain_device(&mut devices[i], &mut state) {
+            match drain_device(&mut devices[i], &mut grab, &mut state) {
                 Ok(reconcile) => needs_reconcile |= reconcile,
                 Err(_) => dead.push(i), // ENODEV: device unplugged
             }
@@ -519,10 +613,16 @@ fn run_loop(
 }
 
 /// Drain everything currently readable from one device, forwarding
-/// non-blocked events to its uinput clone if grabbed. Returns whether
-/// modifier reconciliation is needed (a SYN_DROPPED resync completed).
-fn drain_device(device: &mut OpenDevice, state: &mut LinuxState) -> io::Result<bool> {
+/// non-blocked events to its uinput clone if grabbed. Completes a deferred
+/// grab once the device goes quiet. Returns whether modifier
+/// reconciliation is needed (a SYN_DROPPED resync completed).
+fn drain_device(
+    device: &mut OpenDevice,
+    grab: &mut Option<GrabConfig>,
+    state: &mut LinuxState,
+) -> io::Result<bool> {
     let mut needs_reconcile = false;
+    let mut saw_release = false;
     loop {
         match device.dev.fetch_events() {
             Ok(events) => {
@@ -551,6 +651,7 @@ fn drain_device(device: &mut OpenDevice, state: &mut LinuxState) -> io::Result<b
                             }
                         }
                         EventSummary::Key(_, code, value) => {
+                            saw_release |= value == KEY_RELEASED;
                             // During a resync the event is unreliable for
                             // state tracking (and for a block decision), but
                             // the user really typed it: forward it.
@@ -572,12 +673,24 @@ fn drain_device(device: &mut OpenDevice, state: &mut LinuxState) -> io::Result<b
                     }
                 }
             }
-            Err(e) if e.kind() == io::ErrorKind::WouldBlock => return Ok(needs_reconcile),
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
             // A signal during the read syscall is not device death; retry.
             Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
             Err(e) => return Err(e),
         }
     }
+
+    // Deferred grab: the device was opened while keys were held (see
+    // `pending_grab`); if a release just came in and the device is quiet
+    // now, finish the grab.
+    if device.pending_grab && saw_release {
+        if let Some(cfg) = grab {
+            if !keys_held(&device.dev) {
+                complete_grab(device, cfg);
+            }
+        }
+    }
+    Ok(needs_reconcile)
 }
 
 /// Translate one kernel key event into the cross-platform KeyEvent stream.
@@ -624,6 +737,12 @@ fn process_key(state: &mut LinuxState, code: KeyCode, value: i32) -> bool {
                     .should_block(state.listener.current_modifiers, None);
             if block {
                 state.blocked_modifiers |= changed_modifier;
+            } else {
+                // A forwarded press must never be paired with a blocked
+                // release: clear any stale blocked bit (e.g. left behind by
+                // a keyboard that disappeared mid-hold), mirroring the
+                // non-modifier path below.
+                state.blocked_modifiers &= !changed_modifier;
             }
             block
         } else {
@@ -1017,5 +1136,35 @@ mod tests {
             KeyCode::KEY_LEFTMETA,
             KEY_RELEASED
         ));
+    }
+
+    #[test]
+    fn forwarded_modifier_press_clears_stale_blocked_bit() {
+        // A blocked bit can go stale: the keyboard holding the blocked
+        // modifier vanishes, so its release event never arrives to clear
+        // it. A later press on another keyboard is forwarded (no hotkey
+        // registered) — its release must be forwarded too.
+        let (mut state, _rx) = state_and_receiver();
+        state.blocked_modifiers = Modifiers::CMD_LEFT;
+
+        assert!(!process_key(&mut state, KeyCode::KEY_LEFTMETA, KEY_PRESSED));
+        assert!(!process_key(
+            &mut state,
+            KeyCode::KEY_LEFTMETA,
+            KEY_RELEASED
+        ));
+    }
+
+    #[test]
+    fn reconcile_prunes_stale_blocked_modifiers() {
+        let hotkey = Hotkey::new(Modifiers::CMD, None).unwrap();
+        let (mut state, _rx, _blocking) = state_and_receiver_with(&[hotkey]);
+
+        assert!(process_key(&mut state, KeyCode::KEY_LEFTMETA, KEY_PRESSED));
+        assert_eq!(state.blocked_modifiers, Modifiers::CMD_LEFT);
+
+        // The keyboard holding Cmd disappears: nothing physically held.
+        reconcile_modifiers(&mut state, Modifiers::empty());
+        assert_eq!(state.blocked_modifiers, Modifiers::empty());
     }
 }
