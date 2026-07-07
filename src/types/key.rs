@@ -71,6 +71,12 @@ pub enum Key {
     F18,
     F19,
     F20,
+    /// F21–F24 exist on Windows (VK 0x84–0x87) and in evdev; macOS virtual
+    /// keycodes stop at F20, so these are unreachable from macOS hardware.
+    F21,
+    F22,
+    F23,
+    F24,
 
     // Special keys
     Space,
@@ -135,6 +141,20 @@ pub enum Key {
     CapsLock,
     ScrollLock,
     NumLock,
+
+    /// The dictation / voice key (macOS virtual keycode `0xB0`, macOS only).
+    ///
+    /// Emitted by the microphone/dictation key on the media function row
+    /// (the F5 position on recent Apple keyboards), and by the Globe/Fn key
+    /// when System Settings configures it to start dictation. A Globe tap
+    /// configured for anything else emits `Fn` modifier flags plus a
+    /// different keycode instead.
+    ///
+    /// Hardware events carry `MaskSecondaryFn` in their flags, so hotkeys
+    /// recorded from a key press pair this with the `Fn` modifier (a
+    /// string-configured `"dictation"` hotkey without `fn` will not match
+    /// hardware presses until FN matching is reworked).
+    Dictation,
 
     // Mouse buttons
     MouseLeft,
@@ -205,6 +225,10 @@ impl fmt::Display for Key {
             Key::F18 => write!(f, "F18"),
             Key::F19 => write!(f, "F19"),
             Key::F20 => write!(f, "F20"),
+            Key::F21 => write!(f, "F21"),
+            Key::F22 => write!(f, "F22"),
+            Key::F23 => write!(f, "F23"),
+            Key::F24 => write!(f, "F24"),
             Key::Space => write!(f, "Space"),
             Key::Return => write!(f, "Return"),
             Key::Tab => write!(f, "Tab"),
@@ -263,6 +287,7 @@ impl fmt::Display for Key {
             Key::MouseMiddle => write!(f, "MouseMiddle"),
             Key::MouseX1 => write!(f, "MouseX1"),
             Key::MouseX2 => write!(f, "MouseX2"),
+            Key::Dictation => write!(f, "Dictation"),
         }
     }
 }
@@ -335,6 +360,10 @@ impl FromStr for Key {
             "f18" => Ok(Key::F18),
             "f19" => Ok(Key::F19),
             "f20" => Ok(Key::F20),
+            "f21" => Ok(Key::F21),
+            "f22" => Ok(Key::F22),
+            "f23" => Ok(Key::F23),
+            "f24" => Ok(Key::F24),
 
             // Special keys
             "space" | " " => Ok(Key::Space),
@@ -406,6 +435,11 @@ impl FromStr for Key {
             "mousex1" | "mouse4" | "back" | "xbutton1" => Ok(Key::MouseX1),
             "mousex2" | "mouse5" | "forward" | "xbutton2" => Ok(Key::MouseX2),
 
+            // Dictation / voice key (macOS keycode 0xB0). "globe" is accepted
+            // because the Globe key emits this keycode when configured to
+            // start dictation.
+            "dictation" | "voice" | "globe" => Ok(Key::Dictation),
+
             _ => Err(Error::UnknownKey(s.to_string())),
         }
     }
@@ -434,6 +468,8 @@ mod tests {
         assert_eq!("F1".parse::<Key>().unwrap(), Key::F1);
         assert_eq!("f12".parse::<Key>().unwrap(), Key::F12);
         assert_eq!("F20".parse::<Key>().unwrap(), Key::F20);
+        assert_eq!("f21".parse::<Key>().unwrap(), Key::F21);
+        assert_eq!("F24".parse::<Key>().unwrap(), Key::F24);
     }
 
     #[test]
@@ -484,6 +520,10 @@ mod tests {
             Key::Num9,
             Key::F1,
             Key::F12,
+            Key::F21,
+            Key::F22,
+            Key::F23,
+            Key::F24,
             Key::Space,
             Key::Return,
             Key::Tab,
@@ -503,11 +543,21 @@ mod tests {
             Key::JisUnderscore,
             Key::JisEisu,
             Key::JisKana,
+            Key::Dictation,
         ];
         for key in keys {
             let displayed = format!("{}", key);
             let parsed: Key = displayed.parse().unwrap();
             assert_eq!(parsed, key, "Roundtrip failed for {:?}", key);
         }
+    }
+
+    #[test]
+    fn parse_dictation_aliases() {
+        assert_eq!("dictation".parse::<Key>().unwrap(), Key::Dictation);
+        assert_eq!("voice".parse::<Key>().unwrap(), Key::Dictation);
+        assert_eq!("globe".parse::<Key>().unwrap(), Key::Dictation);
+        // "fn" must keep parsing as the Fn *modifier*, not a key
+        assert!("fn".parse::<Key>().is_err());
     }
 }
