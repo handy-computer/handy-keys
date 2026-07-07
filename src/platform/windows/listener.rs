@@ -17,10 +17,10 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 use windows::Win32::UI::WindowsAndMessaging::{
     CallNextHookEx, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
     MsgWaitForMultipleObjects, PeekMessageW, RegisterClassW, SetWindowsHookExW, TranslateMessage,
-    UnhookWindowsHookEx, HHOOK, HWND_MESSAGE, KBDLLHOOKSTRUCT, LLKHF_EXTENDED, MSG, MSLLHOOKSTRUCT,
-    PM_REMOVE, QS_ALLINPUT, WH_KEYBOARD_LL, WH_MOUSE_LL, WINDOW_EX_STYLE, WINDOW_STYLE, WM_KEYDOWN,
-    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_QUIT, WM_RBUTTONDOWN,
-    WM_RBUTTONUP, WM_SYSKEYDOWN, WM_XBUTTONDOWN, WM_XBUTTONUP, WNDCLASSW,
+    UnhookWindowsHookEx, HHOOK, KBDLLHOOKSTRUCT, LLKHF_EXTENDED, MSG, MSLLHOOKSTRUCT, PM_REMOVE,
+    QS_ALLINPUT, WH_KEYBOARD_LL, WH_MOUSE_LL, WINDOW_EX_STYLE, WINDOW_STYLE, WM_KEYDOWN,
+    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_POWERBROADCAST, WM_QUIT,
+    WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SYSKEYDOWN, WM_XBUTTONDOWN, WM_XBUTTONUP, WNDCLASSW,
 };
 
 use crate::error::Result;
@@ -39,6 +39,12 @@ const WTS_CONSOLE_CONNECT: usize = 0x1;
 const WTS_REMOTE_CONNECT: usize = 0x3;
 const WTS_SESSION_LOCK: usize = 0x7;
 const WTS_SESSION_UNLOCK: usize = 0x8;
+// WM_POWERBROADCAST wParam values (winuser.h) -- the PBT_* constants live
+// behind the Win32_System_Power feature, not worth enabling for two values.
+// RESUMEAUTOMATIC fires on every wake; RESUMESUSPEND follows it only when the
+// wake was user-initiated.
+const PBT_APMRESUMESUSPEND: usize = 0x7;
+const PBT_APMRESUMEAUTOMATIC: usize = 0x12;
 
 /// The side-specific modifier keys we track, paired with their virtual-key
 /// codes. Ordered to match `state::MODIFIER_RELEASE_ORDER`.
@@ -69,6 +75,18 @@ struct HookContext {
 
 thread_local! {
     static HOOK_CONTEXT: std::cell::RefCell<Option<HookContext>> = const { std::cell::RefCell::new(None) };
+
+    /// Set by `watcher_wndproc` when a message delivered via SendMessage
+    /// (bypassing the queue) asks for a hook re-install. The message loop
+    /// owns the hook handles, so the wndproc can only request the re-install,
+    /// not perform it. Thread-local: the wndproc runs on the hook thread, and
+    /// a second listener in the same process must not see this one's requests.
+    static REINSTALL_REQUESTED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Take (and clear) a pending hook re-install request from the wndproc.
+fn take_reinstall_request() -> bool {
+    REINSTALL_REQUESTED.with(|flag| flag.replace(false))
 }
 
 /// What draining the thread message queue observed.
@@ -76,11 +94,13 @@ thread_local! {
 struct DrainOutcome {
     /// WM_QUIT received -- exit the message loop.
     quit: bool,
-    /// A session change (lock/unlock/connect) occurred -- reconcile modifier
-    /// state, since key-ups on the secure desktop never reach the hook.
-    session_change: bool,
-    /// The interactive desktop came back (unlock or console/remote connect) --
-    /// re-install hooks in case Windows silently removed them.
+    /// A session change (lock/unlock/connect) or a resume from sleep
+    /// occurred -- reconcile modifier state, since key-ups on the secure
+    /// desktop (or from before a suspend) never reach the hook.
+    reconcile: bool,
+    /// The interactive desktop came back (unlock, console/remote connect, or
+    /// resume from sleep) -- re-install hooks in case Windows silently
+    /// removed them.
     reinstall_hooks: bool,
 }
 
@@ -95,13 +115,22 @@ fn drain_thread_messages(msg: &mut MSG) -> DrainOutcome {
             }
             if msg.message == WM_WTSSESSION_CHANGE {
                 match msg.wParam.0 {
-                    WTS_SESSION_LOCK => outcome.session_change = true,
+                    WTS_SESSION_LOCK => outcome.reconcile = true,
                     WTS_SESSION_UNLOCK | WTS_CONSOLE_CONNECT | WTS_REMOTE_CONNECT => {
-                        outcome.session_change = true;
+                        outcome.reconcile = true;
                         outcome.reinstall_hooks = true;
                     }
                     _ => {}
                 }
+            }
+            // WM_POWERBROADCAST is documented as sent, not posted, so the
+            // wndproc is the expected delivery path; this arm is a cheap
+            // safety net in case some Windows build posts it instead.
+            if msg.message == WM_POWERBROADCAST
+                && matches!(msg.wParam.0, PBT_APMRESUMESUSPEND | PBT_APMRESUMEAUTOMATIC)
+            {
+                outcome.reconcile = true;
+                outcome.reinstall_hooks = true;
             }
             let _ = TranslateMessage(msg);
             DispatchMessageW(msg);
@@ -192,7 +221,8 @@ fn reconcile_modifiers(ctx: &mut HookContext) {
 }
 
 /// Reconcile modifier state from the hook thread's message loop (used on
-/// session change, where no input event accompanies the state change).
+/// session change and resume from sleep, where no input event accompanies
+/// the state change).
 fn reconcile_modifiers_in_context() {
     HOOK_CONTEXT.with(|ctx_cell| {
         if let Some(ctx) = ctx_cell.borrow_mut().as_mut() {
@@ -201,43 +231,61 @@ fn reconcile_modifiers_in_context() {
     });
 }
 
-/// Wndproc for the session notification window. (The `windows` crate's
-/// DefWindowProcW is a generic Rust wrapper, so it cannot be used as
-/// lpfnWndProc directly.)
+/// Wndproc for the watcher window. (The `windows` crate's DefWindowProcW is
+/// a generic Rust wrapper, so it cannot be used as lpfnWndProc directly.)
 ///
-/// Reconciles here as well as in the drain loop: the drain loop covers posted
-/// delivery of WM_WTSSESSION_CHANGE (what Windows 11 26200 does, verified
-/// live), while this path covers builds that deliver it via SendMessage,
-/// which bypasses the message queue. Double reconciliation on the posted path
-/// is harmless — the second pass finds nothing stale. Hook reinstall stays
-/// loop-driven; it is defensive hardening, while the state reset is the fix.
-unsafe extern "system" fn session_wndproc(
+/// Handles both delivery modes together with the drain loop: the drain loop
+/// covers posted delivery of WM_WTSSESSION_CHANGE (what Windows 11 26200
+/// does, verified live), while this path covers builds that deliver it via
+/// SendMessage, which bypasses the message queue — and WM_POWERBROADCAST,
+/// which is documented as always sent. Double handling on the posted path is
+/// harmless: the second reconcile finds nothing stale, and re-install
+/// requests coalesce through REINSTALL_REQUESTED. The re-install itself
+/// stays on the message loop, which owns the hook handles; this wndproc only
+/// requests it.
+unsafe extern "system" fn watcher_wndproc(
     hwnd: HWND,
     msg: u32,
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> LRESULT {
-    if msg == WM_WTSSESSION_CHANGE {
-        match wparam.0 {
-            WTS_SESSION_LOCK | WTS_SESSION_UNLOCK | WTS_CONSOLE_CONNECT | WTS_REMOTE_CONNECT => {
+    match msg {
+        WM_WTSSESSION_CHANGE => match wparam.0 {
+            WTS_SESSION_LOCK => reconcile_modifiers_in_context(),
+            WTS_SESSION_UNLOCK | WTS_CONSOLE_CONNECT | WTS_REMOTE_CONNECT => {
                 reconcile_modifiers_in_context();
+                REINSTALL_REQUESTED.with(|flag| flag.set(true));
             }
             _ => {}
+        },
+        // Resume from sleep/hibernate: Windows can silently drop LL hooks
+        // across a suspend (Handy #1620), and key-ups from before the
+        // suspend are long gone -- re-arm the hooks and reconcile.
+        WM_POWERBROADCAST => {
+            if matches!(wparam.0, PBT_APMRESUMESUSPEND | PBT_APMRESUMEAUTOMATIC) {
+                reconcile_modifiers_in_context();
+                REINSTALL_REQUESTED.with(|flag| flag.set(true));
+            }
         }
+        _ => {}
     }
     DefWindowProcW(hwnd, msg, wparam, lparam)
 }
 
-/// Create a message-only window registered for WTS session notifications.
-/// WM_WTSSESSION_CHANGE is posted to it and picked out of the queue by
-/// `drain_thread_messages` (verified live: lock 0x7 and unlock 0x8 both arrive).
+/// Create a hidden top-level window that watches WTS session changes and
+/// power (suspend/resume) broadcasts. Top-level, not message-only, is load-
+/// bearing: broadcast messages such as WM_POWERBROADCAST are never delivered
+/// to message-only windows. Without WS_VISIBLE it has no taskbar or Alt-Tab
+/// presence. WM_WTSSESSION_CHANGE is posted to it and picked out of the
+/// queue by `drain_thread_messages` (verified live: lock 0x7 and unlock 0x8
+/// both arrive); WM_POWERBROADCAST is sent and lands in `watcher_wndproc`.
 ///
 /// Returns None on failure. Non-fatal: hooks still work, and stale modifiers
 /// are still corrected lazily by `reconcile_modifiers` on the next key event.
-unsafe fn create_session_notification_window() -> Option<HWND> {
-    let class_name: Vec<u16> = "HandyKeysSessionWatcher\0".encode_utf16().collect();
+unsafe fn create_watcher_window() -> Option<HWND> {
+    let class_name: Vec<u16> = "HandyKeysSystemWatcher\0".encode_utf16().collect();
     let wnd_class = WNDCLASSW {
-        lpfnWndProc: Some(session_wndproc),
+        lpfnWndProc: Some(watcher_wndproc),
         lpszClassName: PCWSTR(class_name.as_ptr()),
         ..Default::default()
     };
@@ -255,7 +303,7 @@ unsafe fn create_session_notification_window() -> Option<HWND> {
         0,
         0,
         0,
-        HWND_MESSAGE,
+        None,
         None,
         None,
         None,
@@ -270,16 +318,17 @@ unsafe fn create_session_notification_window() -> Option<HWND> {
     Some(hwnd)
 }
 
-/// Clean up the session notification window. Must run on the creating thread.
-unsafe fn destroy_session_notification_window(hwnd: HWND) {
+/// Clean up the watcher window. Must run on the creating thread.
+unsafe fn destroy_watcher_window(hwnd: HWND) {
     let _ = WTSUnRegisterSessionNotification(hwnd);
     let _ = DestroyWindow(hwnd);
 }
 
 /// Re-install the low-level hooks, defensively: Windows silently removes an LL
 /// hook whose callback exceeds its timeout budget, and a session away from the
-/// interactive desktop is a common moment for that to surface. (Note lock/unlock
-/// does NOT inherently invalidate hooks -- they survived it in live testing.)
+/// interactive desktop or a suspend/resume cycle is a common moment for that
+/// to surface (Handy #1620). (Note lock/unlock does NOT inherently invalidate
+/// hooks -- they survived it in live testing.)
 ///
 /// The replacements are installed before the old hooks are removed, so a
 /// failure never leaves us hook-less. No messages are pumped between install
@@ -356,10 +405,12 @@ pub(crate) fn spawn(blocking_hotkeys: Option<BlockingHotkeys>) -> Result<Windows
             }
         };
 
-        // Watch for session changes (Win+L lock/unlock, RDP connect): the
-        // secure desktop swallows key-up events, so modifier state must be
-        // reconciled when the session comes back.
-        let session_hwnd = unsafe { create_session_notification_window() };
+        // Watch for session changes (Win+L lock/unlock, RDP connect) and
+        // suspend/resume: the secure desktop swallows key-up events, so
+        // modifier state must be reconciled when the session comes back, and
+        // Windows can silently drop LL hooks across a sleep, so they are
+        // re-armed on resume.
+        let watcher_hwnd = unsafe { create_watcher_window() };
 
         // Message loop - required for low-level hooks to function.
         // Keep the short timeout so shutdown polling behavior remains unchanged.
@@ -375,15 +426,21 @@ pub(crate) fn spawn(blocking_hotkeys: Option<BlockingHotkeys>) -> Result<Windows
             if outcome.quit {
                 break;
             }
-            if outcome.session_change {
+            if outcome.reconcile {
                 reconcile_modifiers_in_context();
             }
-            if outcome.reinstall_hooks {
+            // The wndproc requests re-installs for messages that arrive via
+            // SendMessage (dispatched inside PeekMessageW, never seen by the
+            // drain loop) -- WM_POWERBROADCAST always, WM_WTSSESSION_CHANGE
+            // on builds that send rather than post it.
+            if outcome.reinstall_hooks || take_reinstall_request() {
                 unsafe {
                     if !reinstall_hooks(&mut kb_hook, &mut mouse_hook) {
                         // Keep the old hooks: they usually still work (the
                         // reinstall is defensive hardening, not a repair).
-                        eprintln!("handy-keys: failed to re-install hooks after session change");
+                        eprintln!(
+                            "handy-keys: failed to re-install hooks after session/power change"
+                        );
                     }
                 }
             }
@@ -393,10 +450,10 @@ pub(crate) fn spawn(blocking_hotkeys: Option<BlockingHotkeys>) -> Result<Windows
             wait_for_message_or_timeout(HOOK_LOOP_TIMEOUT_MS);
         }
 
-        // Clean up the session notification window, then the hooks
-        if let Some(hwnd) = session_hwnd {
+        // Clean up the watcher window, then the hooks
+        if let Some(hwnd) = watcher_hwnd {
             unsafe {
-                destroy_session_notification_window(hwnd);
+                destroy_watcher_window(hwnd);
             }
         }
         unsafe {
@@ -696,27 +753,21 @@ mod tests {
         ));
     }
 
-    fn post_session_change(wparam: usize) {
+    fn post_thread_message(message: u32, wparam: usize) {
         use windows::Win32::System::Threading::GetCurrentThreadId;
         use windows::Win32::UI::WindowsAndMessaging::PostThreadMessageW;
         unsafe {
-            PostThreadMessageW(
-                GetCurrentThreadId(),
-                WM_WTSSESSION_CHANGE,
-                WPARAM(wparam),
-                LPARAM(0),
-            )
-            .unwrap();
+            PostThreadMessageW(GetCurrentThreadId(), message, WPARAM(wparam), LPARAM(0)).unwrap();
         }
     }
 
     #[test]
     fn drain_reports_session_unlock_with_reinstall() {
         clear_message_queue();
-        post_session_change(WTS_SESSION_UNLOCK);
+        post_thread_message(WM_WTSSESSION_CHANGE, WTS_SESSION_UNLOCK);
         let mut msg = MSG::default();
         let outcome = drain_thread_messages(&mut msg);
-        assert!(outcome.session_change);
+        assert!(outcome.reconcile);
         assert!(outcome.reinstall_hooks);
         assert!(!outcome.quit);
         clear_message_queue();
@@ -725,10 +776,10 @@ mod tests {
     #[test]
     fn drain_reports_session_lock_without_reinstall() {
         clear_message_queue();
-        post_session_change(WTS_SESSION_LOCK);
+        post_thread_message(WM_WTSSESSION_CHANGE, WTS_SESSION_LOCK);
         let mut msg = MSG::default();
         let outcome = drain_thread_messages(&mut msg);
-        assert!(outcome.session_change);
+        assert!(outcome.reconcile);
         assert!(!outcome.reinstall_hooks);
         clear_message_queue();
     }
@@ -737,12 +788,69 @@ mod tests {
     fn drain_ignores_unrelated_session_events() {
         clear_message_queue();
         // WTS_SESSION_LOGOFF (0x6) is not a state we react to.
-        post_session_change(0x6);
+        post_thread_message(WM_WTSSESSION_CHANGE, 0x6);
         let mut msg = MSG::default();
         let outcome = drain_thread_messages(&mut msg);
-        assert!(!outcome.session_change);
+        assert!(!outcome.reconcile);
         assert!(!outcome.reinstall_hooks);
         clear_message_queue();
+    }
+
+    #[test]
+    fn drain_reports_resume_with_reinstall() {
+        clear_message_queue();
+        post_thread_message(WM_POWERBROADCAST, PBT_APMRESUMEAUTOMATIC);
+        let mut msg = MSG::default();
+        let outcome = drain_thread_messages(&mut msg);
+        assert!(outcome.reconcile);
+        assert!(outcome.reinstall_hooks);
+        assert!(!outcome.quit);
+        clear_message_queue();
+    }
+
+    #[test]
+    fn drain_ignores_non_resume_power_events() {
+        clear_message_queue();
+        // PBT_APMSUSPEND (0x4): nothing to re-arm while going down.
+        post_thread_message(WM_POWERBROADCAST, 0x4);
+        let mut msg = MSG::default();
+        let outcome = drain_thread_messages(&mut msg);
+        assert!(!outcome.reconcile);
+        assert!(!outcome.reinstall_hooks);
+        clear_message_queue();
+    }
+
+    /// Drive the wndproc directly, as SendMessage delivery would. A null HWND
+    /// is fine: DefWindowProcW ignores messages for windows it can't resolve,
+    /// and our handling never touches the handle.
+    fn send_to_wndproc(msg: u32, wparam: usize) {
+        unsafe {
+            watcher_wndproc(HWND::default(), msg, WPARAM(wparam), LPARAM(0));
+        }
+    }
+
+    #[test]
+    fn wndproc_requests_reinstall_on_resume() {
+        let _ = take_reinstall_request();
+        send_to_wndproc(WM_POWERBROADCAST, PBT_APMRESUMESUSPEND);
+        assert!(take_reinstall_request());
+        // The request is consumed by the take.
+        assert!(!take_reinstall_request());
+    }
+
+    #[test]
+    fn wndproc_requests_reinstall_on_session_unlock() {
+        let _ = take_reinstall_request();
+        send_to_wndproc(WM_WTSSESSION_CHANGE, WTS_SESSION_UNLOCK);
+        assert!(take_reinstall_request());
+    }
+
+    #[test]
+    fn wndproc_does_not_request_reinstall_on_lock_or_suspend() {
+        let _ = take_reinstall_request();
+        send_to_wndproc(WM_WTSSESSION_CHANGE, WTS_SESSION_LOCK);
+        send_to_wndproc(WM_POWERBROADCAST, 0x4); // PBT_APMSUSPEND
+        assert!(!take_reinstall_request());
     }
 
     // stale_modifiers / release_events themselves are covered in
