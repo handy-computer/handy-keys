@@ -96,7 +96,8 @@ mod windows_tests {
     use windows::Win32::UI::Input::KeyboardAndMouse::{
         SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT, KEYBD_EVENT_FLAGS,
         KEYEVENTF_KEYUP, KEYEVENTF_SCANCODE, MOUSEINPUT, MOUSEEVENTF_MIDDLEUP, MOUSE_EVENT_FLAGS,
-        VIRTUAL_KEY, VK_F20,
+        VIRTUAL_KEY, VK_F20, VK_MEDIA_NEXT_TRACK, VK_MEDIA_PLAY_PAUSE, VK_MEDIA_PREV_TRACK,
+        VK_MEDIA_STOP,
     };
 
     fn send_f20(key_up: bool) {
@@ -229,5 +230,49 @@ mod windows_tests {
             saw_key_event(&listener, Key::MouseMiddle, false, Duration::from_secs(2)),
             "did not observe injected middle-button-up as Key::MouseMiddle"
         );
+    }
+
+    /// Inject a lone key-up for a virtual key. Media actions (play/pause,
+    /// skip) fire on key-*down*, so a lone key-up is still observed by the
+    /// hook without actually controlling any media in the running session.
+    fn send_vk_key_up(vk: VIRTUAL_KEY) {
+        let input = INPUT {
+            r#type: INPUT_KEYBOARD,
+            Anonymous: INPUT_0 {
+                ki: KEYBDINPUT {
+                    wVk: vk,
+                    wScan: 0,
+                    dwFlags: KEYEVENTF_KEYUP,
+                    time: 0,
+                    dwExtraInfo: 0,
+                },
+            },
+        };
+        let sent = unsafe { SendInput(&[input], std::mem::size_of::<INPUT>() as i32) };
+        assert_eq!(sent, 1, "SendInput failed");
+    }
+
+    /// The four media virtual-keys map to their `Key` variants through the
+    /// real WH_KEYBOARD_LL path. Only reaches the hook when the keyboard/driver
+    /// delivers media keys as VK codes (not as WM_APPCOMMAND) — see TESTING.md.
+    #[test]
+    #[ignore = "needs an interactive desktop session; run: cargo test --test synthetic_input -- --ignored"]
+    fn injected_media_keys_reach_listener() {
+        let listener = KeyboardListener::new().expect("failed to spawn keyboard listener");
+        std::thread::sleep(Duration::from_millis(200));
+
+        for (vk, key) in [
+            (VK_MEDIA_PLAY_PAUSE, Key::PlayPause),
+            (VK_MEDIA_STOP, Key::Stop),
+            (VK_MEDIA_PREV_TRACK, Key::PrevTrack),
+            (VK_MEDIA_NEXT_TRACK, Key::NextTrack),
+        ] {
+            send_vk_key_up(vk);
+            assert!(
+                saw_key_event(&listener, key, false, Duration::from_secs(2)),
+                "did not observe injected media key {key} (vk {:#04x})",
+                vk.0
+            );
+        }
     }
 }

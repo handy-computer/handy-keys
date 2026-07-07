@@ -560,6 +560,10 @@ mod tests {
             Key::JisEisu,
             Key::JisKana,
             Key::Dictation,
+            Key::PlayPause,
+            Key::Stop,
+            Key::PrevTrack,
+            Key::NextTrack,
         ];
         for key in keys {
             let displayed = format!("{}", key);
@@ -575,5 +579,15 @@ mod tests {
         assert_eq!("globe".parse::<Key>().unwrap(), Key::Dictation);
         // "fn" must keep parsing as the Fn *modifier*, not a key
         assert!("fn".parse::<Key>().is_err());
+    }
+
+    #[test]
+    fn parse_media_keys() {
+        // Parsing is case-insensitive and matches the Display spelling.
+        assert_eq!("playpause".parse::<Key>().unwrap(), Key::PlayPause);
+        assert_eq!("PlayPause".parse::<Key>().unwrap(), Key::PlayPause);
+        assert_eq!("stop".parse::<Key>().unwrap(), Key::Stop);
+        assert_eq!("prevtrack".parse::<Key>().unwrap(), Key::PrevTrack);
+        assert_eq!("nexttrack".parse::<Key>().unwrap(), Key::NextTrack);
     }
 }
