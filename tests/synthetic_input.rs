@@ -94,8 +94,9 @@ mod macos {
 mod windows_tests {
     use super::*;
     use windows::Win32::UI::Input::KeyboardAndMouse::{
-        SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYBD_EVENT_FLAGS, KEYEVENTF_KEYUP,
-        KEYEVENTF_SCANCODE, VIRTUAL_KEY, VK_F20,
+        SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT, KEYBD_EVENT_FLAGS,
+        KEYEVENTF_KEYUP, KEYEVENTF_SCANCODE, MOUSEINPUT, MOUSEEVENTF_MIDDLEUP, MOUSE_EVENT_FLAGS,
+        VIRTUAL_KEY, VK_F20,
     };
 
     fn send_f20(key_up: bool) {
@@ -190,6 +191,43 @@ mod windows_tests {
         assert!(
             saw_key_event(&listener, Key::Quote, false, Duration::from_secs(2)),
             "quote-position scancode 0x28 did not map to Key::Quote"
+        );
+    }
+
+    /// Inject a lone mouse-button event by flag. Mirrors the keyboard
+    /// lone-key-up trick: a button-up with no preceding button-down is still
+    /// observed by the low-level hook but performs no action in the session.
+    fn send_mouse_flag(flags: MOUSE_EVENT_FLAGS, mouse_data: u32) {
+        let input = INPUT {
+            r#type: INPUT_MOUSE,
+            Anonymous: INPUT_0 {
+                mi: MOUSEINPUT {
+                    dx: 0,
+                    dy: 0,
+                    mouseData: mouse_data,
+                    dwFlags: flags,
+                    time: 0,
+                    dwExtraInfo: 0,
+                },
+            },
+        };
+        let sent = unsafe { SendInput(&[input], std::mem::size_of::<INPUT>() as i32) };
+        assert_eq!(sent, 1, "SendInput failed");
+    }
+
+    /// The mouse hook path reports button transitions end-to-end. Middle and
+    /// X buttons are reported unconditionally (left/right are gated on a held
+    /// modifier), so a lone middle-button-up is the disturbance-free probe.
+    #[test]
+    #[ignore = "needs an interactive desktop session; run: cargo test --test synthetic_input -- --ignored"]
+    fn injected_mouse_button_reaches_listener() {
+        let listener = KeyboardListener::new().expect("failed to spawn keyboard listener");
+        std::thread::sleep(Duration::from_millis(200));
+
+        send_mouse_flag(MOUSEEVENTF_MIDDLEUP, 0);
+        assert!(
+            saw_key_event(&listener, Key::MouseMiddle, false, Duration::from_secs(2)),
+            "did not observe injected middle-button-up as Key::MouseMiddle"
         );
     }
 }
