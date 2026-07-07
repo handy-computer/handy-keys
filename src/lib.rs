@@ -92,11 +92,47 @@
 //!
 //! Reads evdev devices (`/dev/input/event*`) directly, which works the same
 //! on Wayland, X11, and the console. Requires read access to the device
-//! nodes — typically membership in the `input` group. Hotkey *blocking*
-//! grabs keyboards exclusively and re-injects non-blocked events through
-//! uinput, so it additionally requires write access to `/dev/uinput`;
-//! without it, the blocking constructors fail with an actionable error
-//! (the non-blocking listener is unaffected).
+//! nodes — membership in the `input` group, or the udev rule below. Hotkey
+//! *blocking* grabs keyboards exclusively and re-injects non-blocked events
+//! through uinput, so it additionally requires write access to
+//! `/dev/uinput`; without it, the blocking constructors fail with an
+//! actionable error (the non-blocking listener is unaffected).
+//!
+//! ### Shipping to Linux users
+//!
+//! When distributing an app, don't ask users to join the `input` group —
+//! ship a udev `uaccess` rule instead. systemd-logind then grants access to
+//! the *active seat user* (whoever is physically logged in) through device
+//! ACLs: effective immediately with no logout, and unlike group membership
+//! it does not extend to SSH sessions. One rule file covers both listening
+//! and blocking:
+//!
+//! ```text
+//! # /usr/lib/udev/rules.d/70-yourapp-input.rules
+//! # (uaccess rules must sort before 73-seat-late.rules: keep the number < 73)
+//! KERNEL=="uinput", TAG+="uaccess"
+//! SUBSYSTEM=="input", KERNEL=="event*", TAG+="uaccess"
+//! ```
+//!
+//! Packages (deb, rpm, ...) install this file and run
+//! `udevadm control --reload && udevadm trigger` in their post-install step,
+//! so users never perform any setup. Installer-less formats (AppImage) can
+//! write it on first run — e.g. via `pkexec` — when the constructors report
+//! missing access, then retry immediately: the ACL applies without a
+//! restart. Degrade gracefully where blocking is unavailable:
+//!
+//! ```no_run
+//! use handy_keys::HotkeyManager;
+//!
+//! let manager = HotkeyManager::new_with_blocking() // blocks matched hotkeys
+//!     .or_else(|_| HotkeyManager::new());          // read-only: detect but don't block
+//! // If both fail, prompt the user to grant access, then retry.
+//! # drop(manager);
+//! ```
+//!
+//! Read access to `/dev/input` is inherently keyboard-read capability — the
+//! kernel offers nothing finer-grained. Sandboxes that hide `/dev/input`
+//! (e.g. Flatpak) cannot use this backend.
 
 mod error;
 mod listener;

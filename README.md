@@ -94,6 +94,53 @@ Run at most one blocking listener per system: the first one owns the exclusive
 grabs, and any further blocking listener (in the same process or another)
 detects hotkeys but cannot block them.
 
+### Shipping to Linux users
+
+The setup above is fine for a development machine. When distributing an app,
+don't ask users to join the `input` group — ship a udev **`uaccess`** rule
+instead. systemd-logind then grants access to the *active seat user* (whoever
+is physically logged in) through device ACLs: it takes effect immediately with
+no logout, works the same on X11, Wayland, and the console, and unlike group
+membership it does not extend to SSH sessions. One rule file covers both
+listening and blocking:
+
+```
+# /usr/lib/udev/rules.d/70-yourapp-input.rules
+# (uaccess rules must sort before 73-seat-late.rules, so keep the number < 73)
+KERNEL=="uinput", TAG+="uaccess"
+SUBSYSTEM=="input", KERNEL=="event*", TAG+="uaccess"
+```
+
+Deliver it one of two ways:
+
+- **Packages (deb, rpm, AUR, ...)**: install the rule file from the package
+  and reload udev in the post-install script — users never perform any setup:
+
+  ```sh
+  udevadm control --reload && udevadm trigger
+  ```
+
+- **AppImage and other installer-less formats**: the app cannot place the rule
+  itself, so install it on first run. The constructors fail with actionable
+  errors while access is missing; catch that, show an "enable keyboard access"
+  button, and run a `pkexec` helper that writes the same rule file and runs the
+  reload above. The ACL applies immediately, so retry the constructor without
+  restarting the app.
+
+Degrade gracefully where blocking is unavailable:
+
+```rust
+let manager = HotkeyManager::new_with_blocking() // blocks matched hotkeys
+    .or_else(|_| HotkeyManager::new());          // read-only: detect but don't block
+// If both fail, prompt the user to grant access (see above), then retry.
+```
+
+Be transparent with users about why the permission exists: read access to
+`/dev/input` is keyboard-read capability — the kernel offers nothing
+finer-grained than that. Sandboxed formats that hide `/dev/input` entirely
+(e.g. Flatpak) cannot use this backend at all; they would need the XDG
+GlobalShortcuts portal, which handy-keys does not currently implement.
+
 ## Modifiers
 
 | Modifier | Aliases |
