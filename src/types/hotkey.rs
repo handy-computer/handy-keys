@@ -391,7 +391,10 @@ mod tests {
             let hotkey = Hotkey::new(Modifiers::CMD, key).unwrap();
             let displayed = format!("{}", hotkey);
             let parsed: Hotkey = displayed.parse().unwrap_or_else(|e| {
-                panic!("Failed to parse '{}' (from Cmd+{:?}): {}", displayed, key, e)
+                panic!(
+                    "Failed to parse '{}' (from Cmd+{:?}): {}",
+                    displayed, key, e
+                )
             });
             assert_eq!(parsed, hotkey, "Cmd+{:?} roundtrip failed", key);
         }

@@ -435,7 +435,11 @@ pub(crate) fn spawn(blocking_hotkeys: Option<BlockingHotkeys>) -> Result<Windows
             // on builds that send rather than post it.
             if outcome.reinstall_hooks || take_reinstall_request() {
                 unsafe {
-                    if !reinstall_hooks(&mut kb_hook, &mut mouse_hook) {
+                    if reinstall_hooks(&mut kb_hook, &mut mouse_hook) {
+                        // At most a few lines per unlock/resume, and it makes
+                        // the re-arm observable in the field.
+                        eprintln!("handy-keys: re-armed hooks after session/power change");
+                    } else {
                         // Keep the old hooks: they usually still work (the
                         // reinstall is defensive hardening, not a repair).
                         eprintln!(
