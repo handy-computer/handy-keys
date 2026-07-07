@@ -123,6 +123,10 @@ mod keycodes {
     pub const RIGHT_ARROW: u16 = 0x7C;
     pub const DOWN_ARROW: u16 = 0x7D;
     pub const UP_ARROW: u16 = 0x7E;
+    /// Dictation / voice key. Emitted by the media-row mic key (F5 position)
+    /// and by the Globe key when configured to start dictation. Arrives as a
+    /// normal `KeyDown`/`KeyUp` pair with `MaskSecondaryFn` set in flags.
+    pub const DICTATION: u16 = 0xB0;
 }
 
 /// Convert a macOS virtual keycode to a Key enum
@@ -235,6 +239,7 @@ pub fn keycode_to_key(keycode: CGKeyCode) -> Option<Key> {
         keycodes::JIS_EISU => Some(Key::JisEisu),
         keycodes::JIS_KANA => Some(Key::JisKana),
         keycodes::CAPS_LOCK => Some(Key::CapsLock),
+        keycodes::DICTATION => Some(Key::Dictation),
         _ => None,
     }
 }

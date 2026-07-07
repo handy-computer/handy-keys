@@ -150,11 +150,11 @@ unsafe extern "C-unwind" fn event_tap_callback(
 
                 let key = keycode_to_key(keycode);
 
-                // Skip special function key events (e.g., F3 triggering Mission Control).
-                // These have MaskSecondaryFn set but use special keycodes (like 0xA0)
-                // that we don't recognize. Without this check, they'd be reported as
-                // "Fn pressed" with no key.
-                if key.is_none() && flags_have_fn(flags) {
+                // Skip keycodes we can't map (e.g. special function keys like
+                // Mission Control's 0xA0, or the Globe key's configured action).
+                // A key-less KeyEvent carries no usable information, and the
+                // Windows/Linux backends already emit mapped keys only.
+                if key.is_none() {
                     return event.as_ptr();
                 }
 
@@ -176,8 +176,8 @@ unsafe extern "C-unwind" fn event_tap_callback(
 
                 let key = keycode_to_key(keycode);
 
-                // Skip special function key events (same as KeyDown)
-                if key.is_none() && flags_have_fn(flags) {
+                // Skip unmapped keycodes (same as KeyDown)
+                if key.is_none() {
                     return event.as_ptr();
                 }
 
