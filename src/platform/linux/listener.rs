@@ -92,6 +92,17 @@ const MODIFIER_KEYS: [(KeyCode, Modifiers); 8] = [
 /// grab them (see `is_passthrough_clone`).
 const CLONE_NAME_PREFIX: &str = "handy-keys passthrough: ";
 
+/// Kernel cap on a uinput device name (`UINPUT_MAX_NAME_SIZE`). The evdev
+/// crate enforces it with a hard `assert!(name.len() + 1 < 80)` inside
+/// `VirtualDevice::builder().name(..)`, so an over-long name is a *panic*,
+/// not an `Err` — which kills the whole listener thread and silently
+/// disables every hotkey. We truncate before building so the name always
+/// fits: the usable budget is 78 bytes (80 - 1 for the NUL - the `<`, not
+/// `<=`). Source device names longer than 78 - prefix bytes are common in
+/// practice (e.g. input-remapper's `input-remapper <make> <model> forwarded`
+/// virtual keyboards), so this is a real crash, not a theoretical one.
+const MAX_CLONE_NAME_BYTES: usize = 78;
+
 const KEY_RELEASED: i32 = 0;
 const KEY_PRESSED: i32 = 1;
 const KEY_AUTOREPEAT: i32 = 2;
@@ -411,13 +422,30 @@ fn has_keyboard_keys(dev: &RawDevice) -> bool {
     })
 }
 
+/// Truncate `s` to at most `max_bytes`, never splitting a UTF-8 code point.
+/// Returns the whole string when it already fits.
+fn truncate_on_char_boundary(s: &str, max_bytes: usize) -> &str {
+    if s.len() <= max_bytes {
+        return s;
+    }
+    let mut end = max_bytes;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
+
 /// Grab a keyboard exclusively and create the uinput clone that carries
 /// its non-blocked events onward to the rest of the system.
 fn grab_with_output(dev: &mut RawDevice) -> io::Result<(VirtualDevice, Vec<PathBuf>)> {
-    let name = format!("{CLONE_NAME_PREFIX}{}", dev.name().unwrap_or("keyboard"));
+    let full_name = format!("{CLONE_NAME_PREFIX}{}", dev.name().unwrap_or("keyboard"));
+    // Must fit UINPUT_MAX_NAME_SIZE or the evdev builder panics (see
+    // MAX_CLONE_NAME_BYTES). CLONE_NAME_PREFIX (24 bytes) survives the
+    // truncation, so `is_passthrough_clone` self-filtering still works.
+    let name = truncate_on_char_boundary(&full_name, MAX_CLONE_NAME_BYTES);
 
     let mut builder = VirtualDevice::builder()?
-        .name(name.as_str())
+        .name(name)
         // Clone the vendor/product id so layout-specific quirk handling in
         // compositors follows the real hardware.
         .input_id(dev.input_id());
@@ -1166,5 +1194,39 @@ mod tests {
         // The keyboard holding Cmd disappears: nothing physically held.
         reconcile_modifiers(&mut state, Modifiers::empty());
         assert_eq!(state.blocked_modifiers, Modifiers::empty());
+    }
+
+    #[test]
+    fn short_clone_name_is_left_intact() {
+        let name = format!("{CLONE_NAME_PREFIX}Some Keyboard");
+        assert_eq!(truncate_on_char_boundary(&name, MAX_CLONE_NAME_BYTES), name);
+    }
+
+    #[test]
+    fn long_clone_name_is_truncated_within_kernel_limit() {
+        // input-remapper's real-world virtual keyboard name (>78 bytes with
+        // the prefix) is exactly the case that used to panic the evdev
+        // builder and take down the listener thread.
+        let name = format!(
+            "{CLONE_NAME_PREFIX}input-remapper SteelSeries SteelSeries Apex 3 TKL forwarded"
+        );
+        assert!(name.len() > MAX_CLONE_NAME_BYTES);
+
+        let truncated = truncate_on_char_boundary(&name, MAX_CLONE_NAME_BYTES);
+        assert!(truncated.len() <= MAX_CLONE_NAME_BYTES);
+        // Must stay under the evdev assert (`name.len() + 1 < 80`).
+        assert!(truncated.len() + 1 < 80);
+        // The prefix that self-filtering keys on must survive truncation.
+        assert!(truncated.starts_with(CLONE_NAME_PREFIX));
+    }
+
+    #[test]
+    fn truncation_never_splits_a_utf8_code_point() {
+        // "é" is two bytes; a naive byte slice at the cap would split it.
+        let name = "é".repeat(50);
+        let truncated = truncate_on_char_boundary(&name, 5);
+        assert!(truncated.len() <= 5);
+        // Round-trips as valid UTF-8 (would panic on a mid-code-point cut).
+        assert_eq!(truncated, "éé");
     }
 }
