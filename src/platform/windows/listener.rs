@@ -11,8 +11,9 @@ use windows::Win32::System::RemoteDesktop::{
     WTSRegisterSessionNotification, WTSUnRegisterSessionNotification,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetAsyncKeyState, VIRTUAL_KEY, VK_LCONTROL, VK_LMENU, VK_LSHIFT, VK_LWIN, VK_RCONTROL,
-    VK_RMENU, VK_RSHIFT, VK_RWIN,
+    GetAsyncKeyState, SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYBD_EVENT_FLAGS,
+    KEYEVENTF_KEYUP, VIRTUAL_KEY, VK_LCONTROL, VK_LMENU, VK_LSHIFT, VK_LWIN, VK_RCONTROL, VK_RMENU,
+    VK_RSHIFT, VK_RWIN,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CallNextHookEx, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
@@ -30,6 +31,25 @@ use crate::types::{Key, KeyEvent, Modifiers};
 use super::keycode::{is_altgr_phantom_ctrl, map_key, vk_to_modifier};
 
 const HOOK_LOOP_TIMEOUT_MS: u32 = 10;
+
+/// Modifiers whose lone press-and-release makes the shell activate a menu:
+/// Win opens the Start menu, Alt focuses the active window's menu bar.
+const MENU_MODIFIERS: Modifiers = Modifiers::CMD.union(Modifiers::OPT);
+
+/// Unassigned virtual key injected as the "menu mask" (AutoHotkey's default
+/// mask key). The shell arms its menu when a Win/Alt down→up pair passes
+/// with no other key in between; when we swallow the real key of a Win/Alt
+/// hotkey, this inert keystroke is substituted so the modifier release no
+/// longer reads as a lone tap (cjpais/Handy#917). The VK maps to nothing in
+/// this crate (`vk_to_modifier` and `map_key` both return None), so even
+/// without the dwExtraInfo marker it could never be blocked on its way to
+/// the shell.
+const MENU_MASK_VK: u16 = 0xE8;
+
+/// dwExtraInfo marker stamped on injected mask events so the keyboard hook
+/// recognizes its own injections and passes them through untouched
+/// ("HKMM" in ASCII).
+const MENU_MASK_EXTRA_INFO: usize = 0x484B_4D4D;
 
 // WTS session notification plumbing not exposed by the `windows` crate bindings.
 const NOTIFY_FOR_THIS_SESSION: u32 = 0;
@@ -71,6 +91,10 @@ struct HookContext {
     /// phantom's own events, but GetAsyncKeyState still reports LCtrl as
     /// down while AltGr is held, so reconciliation must not adopt it.
     altgr_phantom_ctrl: bool,
+    /// A menu mask has been injected for the current Win/Alt hold. One per
+    /// hold defuses the shell's menu heuristic for the whole hold; cleared
+    /// once no Win/Alt modifier remains held.
+    menu_mask_sent: bool,
 }
 
 thread_local! {
@@ -218,6 +242,12 @@ fn reconcile_modifiers(ctx: &mut HookContext) {
     }
     ctx.current_modifiers |=
         adoptable_modifiers(ctx.current_modifiers, physical, ctx.altgr_phantom_ctrl);
+    // A Win/Alt-up swallowed by a secure desktop transition ends the hold
+    // without the modifier branch observing it; clear the mask flag here so
+    // the next hold gets its own mask.
+    if !ctx.current_modifiers.intersects(MENU_MODIFIERS) {
+        ctx.menu_mask_sent = false;
+    }
 }
 
 /// Reconcile modifier state from the hook thread's message loop (used on
@@ -375,6 +405,7 @@ pub(crate) fn spawn(blocking_hotkeys: Option<BlockingHotkeys>) -> Result<Windows
                 current_modifiers: Modifiers::empty(),
                 blocking_hotkeys: thread_blocking,
                 altgr_phantom_ctrl: false,
+                menu_mask_sent: false,
             });
         });
 
@@ -490,6 +521,7 @@ unsafe extern "system" fn keyboard_hook_proc(code: i32, wparam: WPARAM, lparam: 
     }
 
     let mut should_block = false;
+    let mut needs_mask = false;
 
     // Process the keyboard event
     HOOK_CONTEXT.with(|ctx_cell| {
@@ -502,6 +534,13 @@ unsafe extern "system" fn keyboard_hook_proc(code: i32, wparam: WPARAM, lparam: 
             let is_extended = (kb_struct.flags.0 & LLKHF_EXTENDED.0) != 0;
 
             let is_key_down = matches!(wparam.0 as u32, WM_KEYDOWN | WM_SYSKEYDOWN);
+
+            // Our own injected menu mask: pass it through untouched. It
+            // exists solely for the shell's benefit and must not update
+            // modifier state, trigger reconciliation, or be emitted.
+            if vk_code == MENU_MASK_VK && kb_struct.dwExtraInfo == MENU_MASK_EXTRA_INFO {
+                return;
+            }
 
             // On AltGr layouts Windows synthesizes a Left Ctrl press/release
             // around every Right Alt event (captured live on UK layout:
@@ -530,12 +569,31 @@ unsafe extern "system" fn keyboard_hook_proc(code: i32, wparam: WPARAM, lparam: 
                     should_block =
                         should_block_hotkey(&ctx.blocking_hotkeys, ctx.current_modifiers, None);
 
+                    // A blocked modifier press (the Shift of a Win+Shift
+                    // modifier-only hotkey) is as invisible to the shell as
+                    // a blocked regular key, so it needs the same mask.
+                    if needs_menu_mask(
+                        should_block,
+                        is_key_down,
+                        ctx.current_modifiers,
+                        ctx.menu_mask_sent,
+                    ) {
+                        ctx.menu_mask_sent = true;
+                        needs_mask = true;
+                    }
+
                     let _ = ctx.event_sender.send(KeyEvent {
                         modifiers: ctx.current_modifiers,
                         key: None,
                         is_key_down,
                         changed_modifier: Some(modifier),
                     });
+                }
+
+                // The hold ends once no Win/Alt modifier remains held; the
+                // next hold gets a fresh mask.
+                if !ctx.current_modifiers.intersects(MENU_MODIFIERS) {
+                    ctx.menu_mask_sent = false;
                 }
             } else {
                 // Non-modifier key: reconcile tracked modifiers against the
@@ -554,6 +612,19 @@ unsafe extern "system" fn keyboard_hook_proc(code: i32, wparam: WPARAM, lparam: 
                         Some(key),
                     );
 
+                    // The shell can no longer see the key we are about to
+                    // swallow; without a substitute, releasing Win/Alt would
+                    // read as a lone tap and open the Start menu (#917).
+                    if needs_menu_mask(
+                        should_block,
+                        is_key_down,
+                        ctx.current_modifiers,
+                        ctx.menu_mask_sent,
+                    ) {
+                        ctx.menu_mask_sent = true;
+                        needs_mask = true;
+                    }
+
                     let _ = ctx.event_sender.send(KeyEvent {
                         modifiers: ctx.current_modifiers,
                         key: Some(key),
@@ -564,6 +635,12 @@ unsafe extern "system" fn keyboard_hook_proc(code: i32, wparam: WPARAM, lparam: 
             }
         }
     });
+
+    // Outside the HOOK_CONTEXT borrow: the injected events re-enter this
+    // hook (where the dwExtraInfo marker passes them straight through).
+    if needs_mask {
+        send_menu_mask();
+    }
 
     if should_block {
         // Return non-zero to block the event from propagating
@@ -600,6 +677,7 @@ unsafe extern "system" fn mouse_hook_proc(code: i32, wparam: WPARAM, lparam: LPA
     }
 
     let mut should_block = false;
+    let mut needs_mask = false;
 
     // Process the mouse event
     HOOK_CONTEXT.with(|ctx_cell| {
@@ -652,6 +730,18 @@ unsafe extern "system" fn mouse_hook_proc(code: i32, wparam: WPARAM, lparam: LPA
                 should_block =
                     should_block_hotkey(&ctx.blocking_hotkeys, ctx.current_modifiers, Some(key));
 
+                // A blocked Win/Alt+click hides the click from the shell
+                // just like a blocked key, so the hold needs the same mask.
+                if needs_menu_mask(
+                    should_block,
+                    is_down,
+                    ctx.current_modifiers,
+                    ctx.menu_mask_sent,
+                ) {
+                    ctx.menu_mask_sent = true;
+                    needs_mask = true;
+                }
+
                 let _ = ctx.event_sender.send(KeyEvent {
                     modifiers: ctx.current_modifiers,
                     key: Some(key),
@@ -662,12 +752,55 @@ unsafe extern "system" fn mouse_hook_proc(code: i32, wparam: WPARAM, lparam: LPA
         }
     });
 
+    if needs_mask {
+        send_menu_mask();
+    }
+
     if should_block {
         // Return non-zero to block the event from propagating
         LRESULT(1)
     } else {
         // Pass to next hook in chain
         CallNextHookEx(None, code, wparam, lparam)
+    }
+}
+
+/// Whether blocking this event must be accompanied by a menu-mask injection:
+/// a real press is being swallowed while a Win/Alt modifier is held, and the
+/// current hold has not been masked yet. Key-ups never need one (the down of
+/// the same key was either masked already or passed through to the shell),
+/// and `already_sent` dedupes auto-repeat and later presses within one hold.
+fn needs_menu_mask(
+    should_block: bool,
+    is_key_down: bool,
+    modifiers: Modifiers,
+    already_sent: bool,
+) -> bool {
+    should_block && is_key_down && !already_sent && modifiers.intersects(MENU_MODIFIERS)
+}
+
+/// Inject a press+release of the menu mask key via SendInput. Must be called
+/// outside the HOOK_CONTEXT borrow, since the injected events re-enter the
+/// keyboard hook on this thread's next message pump.
+fn send_menu_mask() {
+    let key = |flags: KEYBD_EVENT_FLAGS| INPUT {
+        r#type: INPUT_KEYBOARD,
+        Anonymous: INPUT_0 {
+            ki: KEYBDINPUT {
+                wVk: VIRTUAL_KEY(MENU_MASK_VK),
+                wScan: 0,
+                dwFlags: flags,
+                time: 0,
+                dwExtraInfo: MENU_MASK_EXTRA_INFO,
+            },
+        },
+    };
+    let inputs = [key(KEYBD_EVENT_FLAGS(0)), key(KEYEVENTF_KEYUP)];
+    let sent = unsafe { SendInput(&inputs, std::mem::size_of::<INPUT>() as i32) };
+    if sent != inputs.len() as u32 {
+        // Rare (e.g. UIPI filtering); the cost is the pre-mask behavior:
+        // the shell may open its menu when the modifier is released.
+        eprintln!("handy-keys: menu mask injection failed");
     }
 }
 
@@ -892,6 +1025,84 @@ mod tests {
             true,
         );
         assert_eq!(adopt, Modifiers::SHIFT_LEFT);
+    }
+
+    #[test]
+    fn menu_mask_fires_for_blocked_key_down_under_win() {
+        assert!(needs_menu_mask(true, true, Modifiers::CMD_LEFT, false));
+    }
+
+    #[test]
+    fn menu_mask_fires_under_alt() {
+        // Alt has the sibling heuristic: a lone Alt tap focuses the menu bar.
+        assert!(needs_menu_mask(
+            true,
+            true,
+            Modifiers::OPT_LEFT | Modifiers::SHIFT_LEFT,
+            false
+        ));
+    }
+
+    #[test]
+    fn menu_mask_only_when_blocking() {
+        assert!(!needs_menu_mask(false, true, Modifiers::CMD_LEFT, false));
+    }
+
+    #[test]
+    fn menu_mask_not_on_key_up() {
+        // The matching key-down was either masked already or reached the
+        // shell, so the heuristic is not armed.
+        assert!(!needs_menu_mask(true, false, Modifiers::CMD_LEFT, false));
+    }
+
+    #[test]
+    fn menu_mask_once_per_hold() {
+        assert!(!needs_menu_mask(true, true, Modifiers::CMD_LEFT, true));
+    }
+
+    #[test]
+    fn menu_mask_not_for_ctrl_shift_combos() {
+        // Ctrl/Shift releases trigger no shell menu; no mask needed.
+        assert!(!needs_menu_mask(
+            true,
+            true,
+            Modifiers::CTRL_LEFT | Modifiers::SHIFT_LEFT,
+            false
+        ));
+    }
+
+    #[test]
+    fn menu_mask_vk_is_inert_to_our_own_mapping() {
+        // Load-bearing: the injected mask must fall through the hook to
+        // reach the shell. The dwExtraInfo marker guarantees that for our
+        // own injections; this pins the fallback property that the VK maps
+        // to nothing, so even an unmarked vkE8 press stays a no-op.
+        assert!(vk_to_modifier(MENU_MASK_VK).is_none());
+        assert!(map_key(MENU_MASK_VK, 0, false).is_none());
+    }
+
+    #[test]
+    fn reconcile_clears_mask_flag_when_hold_ends_off_desktop() {
+        // Win+L: the Win-up happens on the secure desktop and never reaches
+        // the hook. Reconciliation emits the stale release and must also
+        // clear the mask flag so the next hold gets its own mask. (No keys
+        // are physically held while tests run, so GetAsyncKeyState reports
+        // everything up and CMD_LEFT reads as stale.)
+        let (tx, rx) = mpsc::channel();
+        let mut ctx = HookContext {
+            event_sender: tx,
+            current_modifiers: Modifiers::CMD_LEFT,
+            blocking_hotkeys: None,
+            altgr_phantom_ctrl: false,
+            menu_mask_sent: true,
+        };
+        reconcile_modifiers(&mut ctx);
+        assert_eq!(ctx.current_modifiers, Modifiers::empty());
+        assert!(!ctx.menu_mask_sent);
+        // The stale CMD_LEFT was cleared via a synthetic release event.
+        let release = rx.try_recv().expect("expected a synthetic release");
+        assert_eq!(release.changed_modifier, Some(Modifiers::CMD_LEFT));
+        assert!(!release.is_key_down);
     }
 
     #[test]
