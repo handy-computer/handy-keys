@@ -572,12 +572,7 @@ unsafe extern "system" fn keyboard_hook_proc(code: i32, wparam: WPARAM, lparam: 
                     // A blocked modifier press (the Shift of a Win+Shift
                     // modifier-only hotkey) is as invisible to the shell as
                     // a blocked regular key, so it needs the same mask.
-                    if needs_menu_mask(
-                        should_block,
-                        is_key_down,
-                        ctx.current_modifiers,
-                        ctx.menu_mask_sent,
-                    ) {
+                    if needs_menu_mask(should_block, ctx.current_modifiers, ctx.menu_mask_sent) {
                         ctx.menu_mask_sent = true;
                         needs_mask = true;
                     }
@@ -615,12 +610,7 @@ unsafe extern "system" fn keyboard_hook_proc(code: i32, wparam: WPARAM, lparam: 
                     // The shell can no longer see the key we are about to
                     // swallow; without a substitute, releasing Win/Alt would
                     // read as a lone tap and open the Start menu (#917).
-                    if needs_menu_mask(
-                        should_block,
-                        is_key_down,
-                        ctx.current_modifiers,
-                        ctx.menu_mask_sent,
-                    ) {
+                    if needs_menu_mask(should_block, ctx.current_modifiers, ctx.menu_mask_sent) {
                         ctx.menu_mask_sent = true;
                         needs_mask = true;
                     }
@@ -732,12 +722,7 @@ unsafe extern "system" fn mouse_hook_proc(code: i32, wparam: WPARAM, lparam: LPA
 
                 // A blocked Win/Alt+click hides the click from the shell
                 // just like a blocked key, so the hold needs the same mask.
-                if needs_menu_mask(
-                    should_block,
-                    is_down,
-                    ctx.current_modifiers,
-                    ctx.menu_mask_sent,
-                ) {
+                if needs_menu_mask(should_block, ctx.current_modifiers, ctx.menu_mask_sent) {
                     ctx.menu_mask_sent = true;
                     needs_mask = true;
                 }
@@ -766,17 +751,15 @@ unsafe extern "system" fn mouse_hook_proc(code: i32, wparam: WPARAM, lparam: LPA
 }
 
 /// Whether blocking this event must be accompanied by a menu-mask injection:
-/// a real press is being swallowed while a Win/Alt modifier is held, and the
-/// current hold has not been masked yet. Key-ups never need one (the down of
-/// the same key was either masked already or passed through to the shell),
-/// and `already_sent` dedupes auto-repeat and later presses within one hold.
-fn needs_menu_mask(
-    should_block: bool,
-    is_key_down: bool,
-    modifiers: Modifiers,
-    already_sent: bool,
-) -> bool {
-    should_block && is_key_down && !already_sent && modifiers.intersects(MENU_MODIFIERS)
+/// a real event is being swallowed while a Win/Alt modifier is held, and the
+/// current hold has not been masked yet. Key-ups need masking too: a key
+/// pressed *before* the modifier and released during the hold has its up
+/// blocked, but its down passed to the shell before the hold began, so it
+/// never disarmed the menu heuristic (verified live: without the up-mask,
+/// F20↓ Win↓ F20↑ Win↑ with Win+F20 blocked opens Start). `already_sent`
+/// dedupes auto-repeat, release edges, and later events within one hold.
+fn needs_menu_mask(should_block: bool, modifiers: Modifiers, already_sent: bool) -> bool {
+    should_block && !already_sent && modifiers.intersects(MENU_MODIFIERS)
 }
 
 /// Inject a press+release of the menu mask key via SendInput. Must be called
@@ -1028,15 +1011,14 @@ mod tests {
     }
 
     #[test]
-    fn menu_mask_fires_for_blocked_key_down_under_win() {
-        assert!(needs_menu_mask(true, true, Modifiers::CMD_LEFT, false));
+    fn menu_mask_fires_for_blocked_key_under_win() {
+        assert!(needs_menu_mask(true, Modifiers::CMD_LEFT, false));
     }
 
     #[test]
     fn menu_mask_fires_under_alt() {
         // Alt has the sibling heuristic: a lone Alt tap focuses the menu bar.
         assert!(needs_menu_mask(
-            true,
             true,
             Modifiers::OPT_LEFT | Modifiers::SHIFT_LEFT,
             false
@@ -1045,26 +1027,19 @@ mod tests {
 
     #[test]
     fn menu_mask_only_when_blocking() {
-        assert!(!needs_menu_mask(false, true, Modifiers::CMD_LEFT, false));
-    }
-
-    #[test]
-    fn menu_mask_not_on_key_up() {
-        // The matching key-down was either masked already or reached the
-        // shell, so the heuristic is not armed.
-        assert!(!needs_menu_mask(true, false, Modifiers::CMD_LEFT, false));
+        assert!(!needs_menu_mask(false, Modifiers::CMD_LEFT, false));
     }
 
     #[test]
     fn menu_mask_once_per_hold() {
-        assert!(!needs_menu_mask(true, true, Modifiers::CMD_LEFT, true));
+        // Covers auto-repeat and the release edge of an already-masked press.
+        assert!(!needs_menu_mask(true, Modifiers::CMD_LEFT, true));
     }
 
     #[test]
     fn menu_mask_not_for_ctrl_shift_combos() {
         // Ctrl/Shift releases trigger no shell menu; no mask needed.
         assert!(!needs_menu_mask(
-            true,
             true,
             Modifiers::CTRL_LEFT | Modifiers::SHIFT_LEFT,
             false
