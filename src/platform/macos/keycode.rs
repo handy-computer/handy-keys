@@ -261,15 +261,297 @@ pub fn keycode_to_modifier(keycode: CGKeyCode) -> Option<Modifiers> {
 }
 
 /// Check whether CGEventFlags indicate the FN key is held.
-///
-/// Used alongside keycode-tracked modifier state for side-specific modifiers,
-/// since CGEventFlags are side-agnostic for Cmd/Shift/Ctrl/Opt but FN only
-/// appears in flags.
 pub fn flags_have_fn(flags: CGEventFlags) -> bool {
     flags.contains(CGEventFlags::MaskSecondaryFn)
+}
+
+// Device-dependent modifier flag bits (NX_DEVICE*KEYMASK from IOKit's
+// IOLLEvent.h). CGEventFlags carries these in its low bits, identifying
+// which side of each modifier pair is held. The HID system populates them
+// for hardware (and HID-normalized) events; events posted with caller-set
+// flags via CGEventSetFlags arrive without them, so every consumer below
+// must degrade gracefully when they are absent.
+const NX_DEVICELCTLKEYMASK: u64 = 0x0000_0001;
+const NX_DEVICELSHIFTKEYMASK: u64 = 0x0000_0002;
+const NX_DEVICERSHIFTKEYMASK: u64 = 0x0000_0004;
+const NX_DEVICELCMDKEYMASK: u64 = 0x0000_0008;
+const NX_DEVICERCMDKEYMASK: u64 = 0x0000_0010;
+const NX_DEVICELALTKEYMASK: u64 = 0x0000_0020;
+const NX_DEVICERALTKEYMASK: u64 = 0x0000_0040;
+const NX_DEVICERCTLKEYMASK: u64 = 0x0000_2000;
+
+const ALL_DEVICE_BITS: u64 = NX_DEVICELCTLKEYMASK
+    | NX_DEVICELSHIFTKEYMASK
+    | NX_DEVICERSHIFTKEYMASK
+    | NX_DEVICELCMDKEYMASK
+    | NX_DEVICERCMDKEYMASK
+    | NX_DEVICELALTKEYMASK
+    | NX_DEVICERALTKEYMASK
+    | NX_DEVICERCTLKEYMASK;
+
+/// One left/right modifier pair: its side-agnostic CGEventFlags mask, the
+/// per-side device bits, and the corresponding tracked Modifiers bits.
+pub(super) struct ModifierGroup {
+    pub mask: CGEventFlags,
+    pub left_bit: u64,
+    pub right_bit: u64,
+    pub left: Modifiers,
+    pub right: Modifiers,
+}
+
+pub(super) const MODIFIER_GROUPS: [ModifierGroup; 4] = [
+    ModifierGroup {
+        mask: CGEventFlags::MaskCommand,
+        left_bit: NX_DEVICELCMDKEYMASK,
+        right_bit: NX_DEVICERCMDKEYMASK,
+        left: Modifiers::CMD_LEFT,
+        right: Modifiers::CMD_RIGHT,
+    },
+    ModifierGroup {
+        mask: CGEventFlags::MaskShift,
+        left_bit: NX_DEVICELSHIFTKEYMASK,
+        right_bit: NX_DEVICERSHIFTKEYMASK,
+        left: Modifiers::SHIFT_LEFT,
+        right: Modifiers::SHIFT_RIGHT,
+    },
+    ModifierGroup {
+        mask: CGEventFlags::MaskControl,
+        left_bit: NX_DEVICELCTLKEYMASK,
+        right_bit: NX_DEVICERCTLKEYMASK,
+        left: Modifiers::CTRL_LEFT,
+        right: Modifiers::CTRL_RIGHT,
+    },
+    ModifierGroup {
+        mask: CGEventFlags::MaskAlternate,
+        left_bit: NX_DEVICELALTKEYMASK,
+        right_bit: NX_DEVICERALTKEYMASK,
+        left: Modifiers::OPT_LEFT,
+        right: Modifiers::OPT_RIGHT,
+    },
+];
+
+/// Whether the event's flags carry any per-side device bits, i.e. were
+/// computed by the HID system rather than set by a CGEventPost caller.
+pub(super) fn has_device_bits(flags: CGEventFlags) -> bool {
+    flags.0 & ALL_DEVICE_BITS != 0
+}
+
+/// Decide whether a modifier FlagsChanged event is a press or a release.
+///
+/// The OS doesn't say. For hardware events the answer is in the event's own
+/// flags: the changed key's device bit reflects its post-event state, so
+/// this is stateless and self-correcting even if `current` has drifted
+/// (missed or duplicated FlagsChanged would otherwise invert a
+/// toggle-tracked bit for every subsequent press/release of that key).
+///
+/// The group's device bits, when present, are consulted BEFORE the
+/// side-agnostic group mask: the two can disagree. Observed on macOS 15
+/// with posted events, releasing one of two held same-group keys clears the
+/// group mask while the sibling's device bit stays set; the device bits are
+/// the truthful side. Fallbacks when the group has no device bits
+/// (caller-set flags), in order:
+/// - group mask clear: certainly a release, from any source;
+/// - group mask set: toggle the tracked state, as before.
+pub(super) fn modifier_is_key_down(
+    changed: Modifiers,
+    flags: CGEventFlags,
+    current: Modifiers,
+) -> bool {
+    if changed == Modifiers::FN {
+        return flags_have_fn(flags);
+    }
+    let Some(group) = MODIFIER_GROUPS
+        .iter()
+        .find(|g| changed == g.left || changed == g.right)
+    else {
+        // Not a side-specific modifier; nothing sensible to derive.
+        return !current.contains(changed);
+    };
+    if flags.0 & (group.left_bit | group.right_bit) != 0 {
+        let own_bit = if changed == group.left {
+            group.left_bit
+        } else {
+            group.right_bit
+        };
+        flags.0 & own_bit != 0
+    } else if !flags.contains(group.mask) {
+        false
+    } else {
+        !current.contains(changed)
+    }
 }
 
 /// Check whether CGEventFlags indicate the alpha-shift (Caps Lock) state.
 pub fn flags_have_alpha_shift(flags: CGEventFlags) -> bool {
     flags.contains(CGEventFlags::MaskAlphaShift)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Real events carry extra bits (e.g. NX_NONCOALESCEDMASK 0x20000000);
+    // include one everywhere so the logic is proven insensitive to them.
+    const NOISE: u64 = 0x2000_0000;
+
+    fn flags(bits: u64) -> CGEventFlags {
+        CGEventFlags(bits | NOISE)
+    }
+
+    const SHIFT_MASK: u64 = CGEventFlags::MaskShift.bits();
+    const CMD_MASK: u64 = CGEventFlags::MaskCommand.bits();
+    const CTRL_MASK: u64 = CGEventFlags::MaskControl.bits();
+
+    #[test]
+    fn hardware_press_and_release_follow_device_bit() {
+        // RShift press: group mask + right device bit (observed 0x20020004).
+        assert!(modifier_is_key_down(
+            Modifiers::SHIFT_RIGHT,
+            flags(SHIFT_MASK | NX_DEVICERSHIFTKEYMASK),
+            Modifiers::empty(),
+        ));
+        // Release of the last held shift: mask and bits clear.
+        assert!(!modifier_is_key_down(
+            Modifiers::SHIFT_RIGHT,
+            flags(0),
+            Modifiers::SHIFT_RIGHT,
+        ));
+    }
+
+    #[test]
+    fn both_sides_held_disambiguated_by_device_bits() {
+        // Left released while right stays held: mask still set (the case a
+        // side-agnostic mask can't decide), left bit clear, right bit set.
+        assert!(!modifier_is_key_down(
+            Modifiers::SHIFT_LEFT,
+            flags(SHIFT_MASK | NX_DEVICERSHIFTKEYMASK),
+            Modifiers::SHIFT_LEFT | Modifiers::SHIFT_RIGHT,
+        ));
+        // Right pressed while left already held.
+        assert!(modifier_is_key_down(
+            Modifiers::SHIFT_RIGHT,
+            flags(SHIFT_MASK | NX_DEVICELSHIFTKEYMASK | NX_DEVICERSHIFTKEYMASK),
+            Modifiers::SHIFT_LEFT,
+        ));
+    }
+
+    #[test]
+    fn drifted_state_does_not_invert_hardware_events() {
+        // Tracked state wrongly says RShift is down (a FlagsChanged was
+        // missed). A toggle would now report this press as a release; the
+        // device bit reports the truth.
+        assert!(modifier_is_key_down(
+            Modifiers::SHIFT_RIGHT,
+            flags(SHIFT_MASK | NX_DEVICERSHIFTKEYMASK),
+            Modifiers::SHIFT_RIGHT,
+        ));
+        // And the mirror case: tracked clear, but the event is a release
+        // (right held by the OTHER side... i.e. left still held, mask set).
+        assert!(!modifier_is_key_down(
+            Modifiers::SHIFT_RIGHT,
+            flags(SHIFT_MASK | NX_DEVICELSHIFTKEYMASK),
+            Modifiers::empty(),
+        ));
+    }
+
+    #[test]
+    fn caller_set_flags_fall_back_to_toggle() {
+        // Synthetic FlagsChanged: group mask set, no device bits.
+        let f = flags(SHIFT_MASK);
+        assert!(modifier_is_key_down(
+            Modifiers::SHIFT_LEFT,
+            f,
+            Modifiers::empty(),
+        ));
+        assert!(!modifier_is_key_down(
+            Modifiers::SHIFT_LEFT,
+            f,
+            Modifiers::SHIFT_LEFT,
+        ));
+    }
+
+    #[test]
+    fn group_mask_clear_is_always_a_release() {
+        // Even with tracked state clear (drifted), mask-clear means release.
+        assert!(!modifier_is_key_down(
+            Modifiers::CMD_LEFT,
+            flags(0),
+            Modifiers::empty(),
+        ));
+        // Device bits of OTHER groups present don't change that.
+        assert!(!modifier_is_key_down(
+            Modifiers::CMD_LEFT,
+            flags(CTRL_MASK | NX_DEVICELCTLKEYMASK),
+            Modifiers::CMD_LEFT,
+        ));
+    }
+
+    #[test]
+    fn device_bits_trusted_over_cleared_group_mask() {
+        // Observed on macOS 15 (posted events): releasing LShift while
+        // RShift stays held arrives as 0x20000004 — MaskShift CLEAR but
+        // RShift's device bit still set. The device bits are the truth:
+        // this is a release of left, and right must stay tracked.
+        assert!(!modifier_is_key_down(
+            Modifiers::SHIFT_LEFT,
+            flags(NX_DEVICERSHIFTKEYMASK),
+            Modifiers::SHIFT_LEFT | Modifiers::SHIFT_RIGHT,
+        ));
+        // Mirror shape: own device bit set with the mask missing is a press.
+        assert!(modifier_is_key_down(
+            Modifiers::SHIFT_RIGHT,
+            flags(NX_DEVICERSHIFTKEYMASK),
+            Modifiers::empty(),
+        ));
+    }
+
+    #[test]
+    fn mixed_synthetic_hold_with_hardware_release_toggles() {
+        // A caller-flag source "holds" Cmd (mask set, no device bits) while
+        // the hardware left Cmd is released: group bits are all clear, mask
+        // still set. Toggle on tracked state gives the right answer.
+        assert!(!modifier_is_key_down(
+            Modifiers::CMD_LEFT,
+            flags(CMD_MASK),
+            Modifiers::CMD_LEFT,
+        ));
+    }
+
+    #[test]
+    fn right_ctrl_uses_its_nonadjacent_device_bit() {
+        // RCtrl's device bit (0x2000) is far from the others; make sure the
+        // mapping is right.
+        assert!(modifier_is_key_down(
+            Modifiers::CTRL_RIGHT,
+            flags(CTRL_MASK | NX_DEVICERCTLKEYMASK),
+            Modifiers::empty(),
+        ));
+        assert!(!modifier_is_key_down(
+            Modifiers::CTRL_LEFT,
+            flags(CTRL_MASK | NX_DEVICERCTLKEYMASK),
+            Modifiers::empty(),
+        ));
+    }
+
+    #[test]
+    fn fn_follows_secondary_fn_flag() {
+        assert!(modifier_is_key_down(
+            Modifiers::FN,
+            flags(CGEventFlags::MaskSecondaryFn.bits()),
+            Modifiers::empty(),
+        ));
+        assert!(!modifier_is_key_down(
+            Modifiers::FN,
+            flags(0),
+            Modifiers::FN,
+        ));
+    }
+
+    #[test]
+    fn device_bit_detection() {
+        assert!(has_device_bits(flags(NX_DEVICELSHIFTKEYMASK)));
+        assert!(has_device_bits(flags(NX_DEVICERCTLKEYMASK)));
+        assert!(!has_device_bits(flags(SHIFT_MASK | CMD_MASK)));
+        assert!(!has_device_bits(flags(0)));
+    }
 }

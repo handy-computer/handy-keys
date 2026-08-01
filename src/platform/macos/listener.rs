@@ -18,7 +18,10 @@ use crate::error::{Error, Result};
 use crate::platform::state::{BlockingHotkeys, ListenerState};
 use crate::types::{Key, KeyEvent, Modifiers};
 
-use super::keycode::{flags_have_alpha_shift, flags_have_fn, keycode_to_key, keycode_to_modifier};
+use super::keycode::{
+    flags_have_alpha_shift, flags_have_fn, has_device_bits, keycode_to_key, keycode_to_modifier,
+    modifier_is_key_down, MODIFIER_GROUPS,
+};
 use super::permissions::check_accessibility;
 
 /// Internal listener state returned to KeyboardListener
@@ -75,37 +78,34 @@ pub(crate) fn spawn(blocking_hotkeys: Option<BlockingHotkeys>) -> Result<MacOSLi
 /// Reconcile internally tracked modifiers against the actual CGEventFlags from the OS.
 ///
 /// This corrects drift caused by missed events (e.g., tap disabled by timeout, system
-/// interruptions like Mission Control or screen lock). Should only be called for
-/// non-FlagsChanged events, where flags reflect the current state with no change pending.
+/// interruptions like Mission Control or screen lock). Flags must reflect current
+/// state with no change pending: any non-FlagsChanged event qualifies, as does a
+/// FlagsChanged event (flags there describe the state *after* the change) — though
+/// for the latter, only call this when the flags carry device bits, since without
+/// them the changed group would be reconciled to a left-side guess that the
+/// toggle fallback in `modifier_is_key_down` then fights.
 fn reconcile_modifiers(current: &mut Modifiers, flags: CGEventFlags) {
-    // If OS says a modifier group is NOT held, clear our tracked bits.
-    // This fixes "stuck modifier" from missed release events.
-    if !flags.contains(CGEventFlags::MaskControl) {
-        current.remove(Modifiers::CTRL_LEFT | Modifiers::CTRL_RIGHT);
-    }
-    if !flags.contains(CGEventFlags::MaskShift) {
-        current.remove(Modifiers::SHIFT_LEFT | Modifiers::SHIFT_RIGHT);
-    }
-    if !flags.contains(CGEventFlags::MaskCommand) {
-        current.remove(Modifiers::CMD_LEFT | Modifiers::CMD_RIGHT);
-    }
-    if !flags.contains(CGEventFlags::MaskAlternate) {
-        current.remove(Modifiers::OPT_LEFT | Modifiers::OPT_RIGHT);
-    }
-
-    // If OS says a modifier group IS held but we have no bits for it,
-    // we missed a press event. Default to left side as fallback.
-    if flags.contains(CGEventFlags::MaskControl) && !current.intersects(Modifiers::CTRL) {
-        current.insert(Modifiers::CTRL_LEFT);
-    }
-    if flags.contains(CGEventFlags::MaskShift) && !current.intersects(Modifiers::SHIFT) {
-        current.insert(Modifiers::SHIFT_LEFT);
-    }
-    if flags.contains(CGEventFlags::MaskCommand) && !current.intersects(Modifiers::CMD) {
-        current.insert(Modifiers::CMD_LEFT);
-    }
-    if flags.contains(CGEventFlags::MaskAlternate) && !current.intersects(Modifiers::OPT) {
-        current.insert(Modifiers::OPT_LEFT);
+    for group in &MODIFIER_GROUPS {
+        let both = group.left | group.right;
+        if flags.0 & (group.left_bit | group.right_bit) != 0 {
+            // Device bits identify exactly which sides are held. Trusted
+            // over the group mask: the two can disagree (see
+            // modifier_is_key_down), and the device bits are truthful.
+            current.remove(both);
+            if flags.0 & group.left_bit != 0 {
+                current.insert(group.left);
+            }
+            if flags.0 & group.right_bit != 0 {
+                current.insert(group.right);
+            }
+        } else if !flags.contains(group.mask) {
+            // Not held per the OS: fixes "stuck modifier" from missed releases.
+            current.remove(both);
+        } else if !current.intersects(both) {
+            // Held, but the source set no device bits and we track nothing
+            // for the group: we missed a press. Default to left as fallback.
+            current.insert(group.left);
+        }
     }
 }
 
@@ -128,8 +128,9 @@ unsafe extern "C-unwind" fn event_tap_callback(
 
     if let Ok(mut state) = state.lock() {
         // Reconcile tracked modifiers against OS flags for non-FlagsChanged events.
-        // On FlagsChanged, flags reflect the state *after* the current change, so
-        // reconciling would fight with the toggle logic.
+        // FlagsChanged reconciles in its own branch, and only when the flags carry
+        // device bits — without them the changed group would be reconciled to a
+        // left-side guess that the toggle fallback then fights.
         if event_type != CGEventType::FlagsChanged {
             reconcile_modifiers(&mut state.current_modifiers, flags);
         }
@@ -217,10 +218,20 @@ unsafe extern "C-unwind" fn event_tap_callback(
                         changed_modifier: None,
                     });
                 } else if let Some(modifier_bit) = changed_modifier {
-                    // Regular modifier key — use keycode to toggle the specific bit
-                    let was_set = state.current_modifiers.contains(modifier_bit);
-                    let is_key_down = !was_set;
+                    // Regular modifier key (or FN). The OS doesn't say whether
+                    // this is a press or a release; derive it from the event's
+                    // own flags where possible (see modifier_is_key_down).
+                    let is_key_down =
+                        modifier_is_key_down(modifier_bit, flags, state.current_modifiers);
 
+                    if has_device_bits(flags) {
+                        // HID-computed flags describe the full post-event
+                        // modifier state; adopt it wholesale. This also
+                        // repairs drift in groups this key didn't touch.
+                        reconcile_modifiers(&mut state.current_modifiers, flags);
+                    }
+                    // Idempotent under reconcile; carries the FN bit and the
+                    // caller-set-flags fallback, which reconcile can't.
                     if is_key_down {
                         state.current_modifiers |= modifier_bit;
                     } else {
@@ -243,30 +254,8 @@ unsafe extern "C-unwind" fn event_tap_callback(
                         modifiers: new_modifiers,
                         key: None,
                         is_key_down,
-                        changed_modifier: changed_modifier,
+                        changed_modifier,
                     });
-                } else if keycode == 0x3F {
-                    // FN key itself — tracked via flags, not keycode state
-                    let had_fn = modifiers.contains(Modifiers::FN);
-                    let has_fn = flags_have_fn(flags);
-                    if had_fn != has_fn {
-                        let new_modifiers = if has_fn {
-                            state.current_modifiers | Modifiers::FN
-                        } else {
-                            state.current_modifiers & !Modifiers::FN
-                        };
-
-                        if has_fn {
-                            should_block = state.should_block(new_modifiers, None);
-                        }
-
-                        let _ = state.event_sender.send(KeyEvent {
-                            modifiers: new_modifiers,
-                            key: None,
-                            is_key_down: has_fn,
-                            changed_modifier: Some(Modifiers::FN),
-                        });
-                    }
                 }
             }
             // Mouse button events
@@ -482,5 +471,84 @@ fn run_event_tap(
     CFMachPort::invalidate(&tap);
     unsafe {
         let _ = Arc::from_raw(state_ptr as *const Mutex<ListenerState>);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // NX_DEVICE* bits as observed from real events (see keycode.rs).
+    const LSHIFT_BIT: u64 = 0x0002;
+    const RSHIFT_BIT: u64 = 0x0004;
+    const RCMD_BIT: u64 = 0x0010;
+
+    fn flags(bits: u64) -> CGEventFlags {
+        // Real events carry extra bits (e.g. NX_NONCOALESCEDMASK).
+        CGEventFlags(bits | 0x2000_0000)
+    }
+
+    #[test]
+    fn reconcile_adopts_device_bits_exactly() {
+        // Tracked left Cmd, but the OS says right Cmd (wrong-side drift,
+        // e.g. seeded by the old left-guess while the tap was disabled).
+        let mut current = Modifiers::CMD_LEFT;
+        reconcile_modifiers(
+            &mut current,
+            flags(CGEventFlags::MaskCommand.bits() | RCMD_BIT),
+        );
+        assert_eq!(current, Modifiers::CMD_RIGHT);
+    }
+
+    #[test]
+    fn reconcile_restores_both_sides_from_device_bits() {
+        let mut current = Modifiers::empty();
+        reconcile_modifiers(
+            &mut current,
+            flags(CGEventFlags::MaskShift.bits() | LSHIFT_BIT | RSHIFT_BIT),
+        );
+        assert_eq!(current, Modifiers::SHIFT_LEFT | Modifiers::SHIFT_RIGHT);
+    }
+
+    #[test]
+    fn reconcile_clears_groups_the_os_says_are_up() {
+        let mut current = Modifiers::CMD_LEFT | Modifiers::SHIFT_RIGHT | Modifiers::CTRL_LEFT;
+        reconcile_modifiers(
+            &mut current,
+            flags(CGEventFlags::MaskShift.bits() | RSHIFT_BIT),
+        );
+        assert_eq!(current, Modifiers::SHIFT_RIGHT);
+    }
+
+    #[test]
+    fn reconcile_trusts_device_bits_over_cleared_mask() {
+        // The observed posted-event shape 0x20000004: MaskShift clear but
+        // RShift's device bit set. Right must survive, left must go.
+        let mut current = Modifiers::SHIFT_LEFT | Modifiers::SHIFT_RIGHT;
+        reconcile_modifiers(&mut current, flags(RSHIFT_BIT));
+        assert_eq!(current, Modifiers::SHIFT_RIGHT);
+    }
+
+    #[test]
+    fn reconcile_without_device_bits_keeps_tracked_side() {
+        // Caller-set flags say Cmd is held but not which side; whatever we
+        // tracked (here: right) must survive, not be rewritten to left.
+        let mut current = Modifiers::CMD_RIGHT;
+        reconcile_modifiers(&mut current, flags(CGEventFlags::MaskCommand.bits()));
+        assert_eq!(current, Modifiers::CMD_RIGHT);
+    }
+
+    #[test]
+    fn reconcile_without_device_bits_defaults_to_left() {
+        let mut current = Modifiers::empty();
+        reconcile_modifiers(&mut current, flags(CGEventFlags::MaskCommand.bits()));
+        assert_eq!(current, Modifiers::CMD_LEFT);
+    }
+
+    #[test]
+    fn reconcile_never_touches_fn() {
+        let mut current = Modifiers::FN | Modifiers::CMD_LEFT;
+        reconcile_modifiers(&mut current, flags(0));
+        assert_eq!(current, Modifiers::FN);
     }
 }

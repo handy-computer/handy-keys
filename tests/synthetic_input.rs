@@ -50,9 +50,20 @@ fn saw_key_event(
 #[cfg(target_os = "macos")]
 mod macos {
     use super::*;
-    use objc2_core_graphics::{CGEvent, CGEventSource, CGEventSourceStateID, CGEventTapLocation};
+    use std::sync::Mutex;
+
+    use handy_keys::{KeyEvent, Modifiers};
+    use objc2_core_graphics::{
+        CGEvent, CGEventFlags, CGEventSource, CGEventSourceStateID, CGEventTapLocation, CGEventType,
+    };
+
+    /// Tests post real modifier events; serialize them so one test's
+    /// injections don't bleed into another's assertions.
+    static SERIAL: Mutex<()> = Mutex::new(());
 
     const VK_F20: u16 = 0x5A;
+    const VK_LSHIFT: u16 = 0x38;
+    const VK_RSHIFT: u16 = 0x3C;
 
     fn post_f20(key_down: bool) {
         let source = CGEventSource::new(CGEventSourceStateID::HIDSystemState);
@@ -61,13 +72,58 @@ mod macos {
         CGEvent::post(CGEventTapLocation::HIDEventTap, Some(&event));
     }
 
+    /// Post a modifier key transition through the HID event tap. The HID
+    /// system converts it to a FlagsChanged event and computes the flags
+    /// itself, including the per-side NX_DEVICE* bits — the same shape a
+    /// hardware keyboard produces.
+    fn post_hid_modifier(keycode: u16, key_down: bool) {
+        let source = CGEventSource::new(CGEventSourceStateID::HIDSystemState);
+        let event = CGEvent::new_keyboard_event(source.as_deref(), keycode, key_down)
+            .expect("failed to create keyboard event");
+        CGEvent::post(CGEventTapLocation::HIDEventTap, Some(&event));
+    }
+
+    /// Post a FlagsChanged event with caller-set flags, the shape automation
+    /// tools produce: the side-agnostic Mask* bits only, no device bits.
+    /// (Verified empirically: CGEventSetFlags survives HID-tap posting
+    /// untouched — the system does not add device bits.)
+    fn post_caller_flags_changed(keycode: u16, key_down: bool, flags: CGEventFlags) {
+        let source = CGEventSource::new(CGEventSourceStateID::HIDSystemState);
+        let event = CGEvent::new_keyboard_event(source.as_deref(), keycode, key_down)
+            .expect("failed to create keyboard event");
+        CGEvent::set_type(Some(&event), CGEventType::FlagsChanged);
+        CGEvent::set_flags(Some(&event), flags);
+        CGEvent::post(CGEventTapLocation::HIDEventTap, Some(&event));
+    }
+
+    fn saw_event(
+        listener: &KeyboardListener,
+        timeout: Duration,
+        pred: impl Fn(&KeyEvent) -> bool,
+    ) -> bool {
+        let deadline = Instant::now() + timeout;
+        while let Some(remaining) = deadline.checked_duration_since(Instant::now()) {
+            match listener.recv_timeout(remaining) {
+                Ok(event) if pred(&event) => return true,
+                Ok(_) => {}
+                Err(_) => return false,
+            }
+        }
+        false
+    }
+
+    fn new_listener() -> KeyboardListener {
+        KeyboardListener::new().expect(
+            "KeyboardListener::new failed — grant accessibility permission to the \
+             terminal running this test (System Settings > Privacy & Security > Accessibility)",
+        )
+    }
+
     #[test]
     #[ignore = "needs accessibility permission; run: cargo test --test synthetic_input -- --ignored"]
     fn injected_f20_reaches_listener() {
-        let listener = KeyboardListener::new().expect(
-            "KeyboardListener::new failed — grant accessibility permission to the \
-             terminal running this test (System Settings > Privacy & Security > Accessibility)",
-        );
+        let _serial = SERIAL.lock().unwrap();
+        let listener = new_listener();
 
         post_f20(true);
         assert!(
@@ -80,6 +136,137 @@ mod macos {
             saw_key_event(&listener, Key::F20, false, Duration::from_secs(2)),
             "did not observe injected F20 key-up"
         );
+    }
+
+    /// Both shifts held and released one at a time. The LShift release
+    /// while RShift stays down arrives with the group mask and device bits
+    /// in disagreement (observed: MaskShift clear, RShift device bit still
+    /// set) — only the per-side device bits identify both the direction and
+    /// that right must stay tracked, so this exercises the device-bit path
+    /// end to end.
+    #[test]
+    #[ignore = "needs accessibility permission; run: cargo test --test synthetic_input -- --ignored"]
+    fn overlapping_shifts_report_correct_side_and_direction() {
+        let _serial = SERIAL.lock().unwrap();
+        let listener = new_listener();
+        let timeout = Duration::from_secs(2);
+
+        post_hid_modifier(VK_LSHIFT, true);
+        assert!(
+            saw_event(&listener, timeout, |e| {
+                e.changed_modifier == Some(Modifiers::SHIFT_LEFT)
+                    && e.is_key_down
+                    && e.modifiers.contains(Modifiers::SHIFT_LEFT)
+            }),
+            "LShift press not observed"
+        );
+
+        post_hid_modifier(VK_RSHIFT, true);
+        assert!(
+            saw_event(&listener, timeout, |e| {
+                e.changed_modifier == Some(Modifiers::SHIFT_RIGHT)
+                    && e.is_key_down
+                    && e.modifiers
+                        .contains(Modifiers::SHIFT_LEFT | Modifiers::SHIFT_RIGHT)
+            }),
+            "RShift press (with LShift held) not observed"
+        );
+
+        post_hid_modifier(VK_LSHIFT, false);
+        assert!(
+            saw_event(&listener, timeout, |e| {
+                e.changed_modifier == Some(Modifiers::SHIFT_LEFT)
+                    && !e.is_key_down
+                    && !e.modifiers.contains(Modifiers::SHIFT_LEFT)
+                    && e.modifiers.contains(Modifiers::SHIFT_RIGHT)
+            }),
+            "LShift release while RShift held was not reported as a release \
+             with RShift still tracked"
+        );
+
+        post_hid_modifier(VK_RSHIFT, false);
+        assert!(
+            saw_event(&listener, timeout, |e| {
+                e.changed_modifier == Some(Modifiers::SHIFT_RIGHT)
+                    && !e.is_key_down
+                    && !e.modifiers.intersects(Modifiers::SHIFT)
+            }),
+            "final RShift release not observed"
+        );
+    }
+
+    /// FlagsChanged events with caller-set flags (no device bits) must keep
+    /// working via the toggle fallback.
+    #[test]
+    #[ignore = "needs accessibility permission; run: cargo test --test synthetic_input -- --ignored"]
+    fn caller_set_flags_still_toggle() {
+        let _serial = SERIAL.lock().unwrap();
+        let listener = new_listener();
+        let timeout = Duration::from_secs(2);
+
+        post_caller_flags_changed(VK_LSHIFT, true, CGEventFlags::MaskShift);
+        assert!(
+            saw_event(&listener, timeout, |e| {
+                e.changed_modifier == Some(Modifiers::SHIFT_LEFT) && e.is_key_down
+            }),
+            "caller-flag LShift press not observed"
+        );
+
+        post_caller_flags_changed(VK_LSHIFT, false, CGEventFlags(0));
+        assert!(
+            saw_event(&listener, timeout, |e| {
+                e.changed_modifier == Some(Modifiers::SHIFT_LEFT) && !e.is_key_down
+            }),
+            "caller-flag LShift release not observed"
+        );
+    }
+
+    /// The regression this change exists for: once tracked state has
+    /// drifted (here seeded with a caller-flag press the OS knows nothing
+    /// about), a real press of that modifier must still report as a press.
+    /// Toggle-based tracking inverted it — press reported as release, and
+    /// every subsequent transition of the key stayed inverted.
+    #[test]
+    #[ignore = "needs accessibility permission; run: cargo test --test synthetic_input -- --ignored"]
+    fn drifted_state_does_not_invert_hardware_press() {
+        let _serial = SERIAL.lock().unwrap();
+        let listener = new_listener();
+        let timeout = Duration::from_secs(2);
+
+        // Seed drift: tracked state now says LShift is down, though no
+        // shift is physically held.
+        post_caller_flags_changed(VK_LSHIFT, true, CGEventFlags::MaskShift);
+        assert!(
+            saw_event(&listener, timeout, |e| {
+                e.changed_modifier == Some(Modifiers::SHIFT_LEFT) && e.is_key_down
+            }),
+            "drift-seeding press not observed"
+        );
+
+        // A real LShift press arrives. Its device bit says "down"; the
+        // toggle would have said "up".
+        post_hid_modifier(VK_LSHIFT, true);
+        assert!(
+            saw_event(&listener, timeout, |e| {
+                e.changed_modifier == Some(Modifiers::SHIFT_LEFT) && e.is_key_down
+            }),
+            "hardware LShift press was inverted by drifted tracked state"
+        );
+
+        post_hid_modifier(VK_LSHIFT, false);
+        assert!(
+            saw_event(&listener, timeout, |e| {
+                e.changed_modifier == Some(Modifiers::SHIFT_LEFT) && !e.is_key_down
+            }),
+            "hardware LShift release not observed"
+        );
+
+        // Balance the seeded caller-flag press so no synthetic shift state
+        // lingers in the session after the test.
+        post_caller_flags_changed(VK_LSHIFT, false, CGEventFlags(0));
+        saw_event(&listener, Duration::from_millis(500), |e| {
+            e.changed_modifier == Some(Modifiers::SHIFT_LEFT) && !e.is_key_down
+        });
     }
 }
 

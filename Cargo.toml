@@ -26,10 +26,6 @@ path = "examples/record_hotkey.rs"
 name = "diagnostic"
 path = "examples/diagnostic.rs"
 
-[[example]]
-name = "ax_permission_probe"
-path = "examples/ax_permission_probe.rs"
-
 [dependencies]
 bitflags = { version = "2", features = ["serde"] }
 serde = { version = "1", features = ["derive"] }
