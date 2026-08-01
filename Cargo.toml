@@ -1,6 +1,6 @@
 [package]
 name = "handy-keys"
-version = "0.3.2"
+version = "0.3.3"
 edition = "2021"
 description = "Cross-platform global keyboard shortcuts library"
 license = "MIT"
@@ -25,10 +25,6 @@ path = "examples/record_hotkey.rs"
 [[example]]
 name = "diagnostic"
 path = "examples/diagnostic.rs"
-
-[[example]]
-name = "ax_permission_probe"
-path = "examples/ax_permission_probe.rs"
 
 [dependencies]
 bitflags = { version = "2", features = ["serde"] }
