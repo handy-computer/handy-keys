@@ -19,7 +19,10 @@ use crate::error::{Error, Result};
 use crate::platform::state::{BlockingHotkeys, ListenerState};
 use crate::types::{Key, KeyEvent, Modifiers};
 
-use super::keycode::{flags_have_alpha_shift, flags_have_fn, keycode_to_key, keycode_to_modifier};
+use super::keycode::{
+    flags_have_alpha_shift, flags_have_any_modifier, flags_have_fn, keycode_to_key,
+    keycode_to_modifier,
+};
 use super::permissions::check_accessibility;
 
 /// The tap thread's run loop, handed back to the public listener so Drop can
@@ -195,6 +198,28 @@ unsafe extern "C-unwind" fn event_tap_callback(
 
     let cg_event = event.as_ref();
     let flags = CGEvent::flags(Some(cg_event));
+
+    // Fast path: an unmodified left/right click can never match a binding, so
+    // it falls through to the no-op arm below anyway. Taking the state lock for
+    // it is not just wasted work — it is actively harmful. This tap runs in
+    // Default mode, so every click is *held* until the callback returns, and
+    // the lock is shared with the manager thread. Whenever that thread holds it
+    // (registering bindings, reconciling modifiers), clicks queue behind it
+    // system-wide. If the delayed event is the LeftMouseUp that ends a
+    // drag-and-drop, the source app never sees the release and the dragged item
+    // stays glued to the cursor until the tap is torn down — which in practice
+    // means logging out. Returning before the lock keeps ordinary clicks off
+    // the mutex entirely.
+    if matches!(
+        event_type,
+        CGEventType::LeftMouseDown
+            | CGEventType::LeftMouseUp
+            | CGEventType::RightMouseDown
+            | CGEventType::RightMouseUp
+    ) && !flags_have_any_modifier(flags)
+    {
+        return event.as_ptr();
+    }
 
     let mut should_block = false;
 
@@ -750,5 +775,39 @@ mod tests {
             Modifiers::empty(),
             "stale modifiers must be reconciled away on tap-disable"
         );
+    }
+
+    /// The unmodified-click fast path is what keeps ordinary clicks off the
+    /// state mutex, so the predicate guarding it must not report a modifier
+    /// for flags that cannot take part in a binding.
+    #[test]
+    fn only_binding_modifiers_defeat_the_click_fast_path() {
+        assert!(
+            !flags_have_any_modifier(CGEventFlags::empty()),
+            "a plain click must take the fast path"
+        );
+
+        for (flags, name) in [
+            (CGEventFlags::MaskAlphaShift, "caps lock"),
+            (CGEventFlags::MaskNumericPad, "numeric pad"),
+        ] {
+            assert!(
+                !flags_have_any_modifier(flags),
+                "{name} cannot be bound, so it must not defeat the fast path"
+            );
+        }
+
+        for (flags, name) in [
+            (CGEventFlags::MaskShift, "shift"),
+            (CGEventFlags::MaskControl, "control"),
+            (CGEventFlags::MaskAlternate, "option"),
+            (CGEventFlags::MaskCommand, "command"),
+            (CGEventFlags::MaskSecondaryFn, "fn"),
+        ] {
+            assert!(
+                flags_have_any_modifier(flags),
+                "{name} can be bound, so the click must reach the dispatch path"
+            );
+        }
     }
 }

@@ -273,3 +273,18 @@ pub fn flags_have_fn(flags: CGEventFlags) -> bool {
 pub fn flags_have_alpha_shift(flags: CGEventFlags) -> bool {
     flags.contains(CGEventFlags::MaskAlphaShift)
 }
+
+/// Check whether any binding-relevant modifier is held.
+///
+/// Caps Lock and the numeric-pad flag are deliberately excluded: neither can
+/// take part in a binding, so treating them as "modified" would defeat the
+/// unmodified-click fast path in the event tap callback.
+pub fn flags_have_any_modifier(flags: CGEventFlags) -> bool {
+    flags.intersects(
+        CGEventFlags::MaskShift
+            | CGEventFlags::MaskControl
+            | CGEventFlags::MaskAlternate
+            | CGEventFlags::MaskCommand
+            | CGEventFlags::MaskSecondaryFn,
+    )
+}
