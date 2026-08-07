@@ -92,6 +92,8 @@ pub enum Key {
     Delete,
     ForwardDelete,
     Insert,
+    /// Pause/Break — PC keyboards only; macOS has no keycode for it.
+    Pause,
     Home,
     End,
     PageUp,
@@ -246,6 +248,7 @@ impl fmt::Display for Key {
             Key::Delete => write!(f, "Delete"),
             Key::ForwardDelete => write!(f, "ForwardDelete"),
             Key::Insert => write!(f, "Insert"),
+            Key::Pause => write!(f, "Pause"),
             Key::Home => write!(f, "Home"),
             Key::End => write!(f, "End"),
             Key::PageUp => write!(f, "PageUp"),
@@ -389,6 +392,7 @@ impl FromStr for Key {
             "delete" | "backspace" => Ok(Key::Delete),
             "forwarddelete" | "del" => Ok(Key::ForwardDelete),
             "insert" | "ins" => Ok(Key::Insert),
+            "pause" | "break" => Ok(Key::Pause),
             "home" => Ok(Key::Home),
             "end" => Ok(Key::End),
             "pageup" => Ok(Key::PageUp),
@@ -544,6 +548,7 @@ mod tests {
             Key::Return,
             Key::Tab,
             Key::Escape,
+            Key::Pause,
             Key::LeftArrow,
             Key::RightArrow,
             Key::KeypadPlus,
@@ -589,5 +594,13 @@ mod tests {
         assert_eq!("stop".parse::<Key>().unwrap(), Key::Stop);
         assert_eq!("prevtrack".parse::<Key>().unwrap(), Key::PrevTrack);
         assert_eq!("nexttrack".parse::<Key>().unwrap(), Key::NextTrack);
+    }
+
+    #[test]
+    fn parse_pause_aliases() {
+        // Pause and Break share one physical key on PC hardware.
+        assert_eq!("pause".parse::<Key>().unwrap(), Key::Pause);
+        assert_eq!("Pause".parse::<Key>().unwrap(), Key::Pause);
+        assert_eq!("break".parse::<Key>().unwrap(), Key::Pause);
     }
 }

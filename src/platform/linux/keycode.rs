@@ -88,6 +88,7 @@ pub fn key_code_to_key(code: KeyCode) -> Option<Key> {
         KeyCode::KEY_BACKSPACE => Some(Key::Delete),
         KeyCode::KEY_DELETE => Some(Key::ForwardDelete),
         KeyCode::KEY_INSERT => Some(Key::Insert),
+        KeyCode::KEY_PAUSE => Some(Key::Pause),
         KeyCode::KEY_HOME => Some(Key::Home),
         KeyCode::KEY_END => Some(Key::End),
         KeyCode::KEY_PAGEUP => Some(Key::PageUp),
@@ -180,6 +181,7 @@ mod tests {
         assert_eq!(key_code_to_key(KeyCode::KEY_SPACE), Some(Key::Space));
         assert_eq!(key_code_to_key(KeyCode::KEY_ENTER), Some(Key::Return));
         assert_eq!(key_code_to_key(KeyCode::KEY_INSERT), Some(Key::Insert));
+        assert_eq!(key_code_to_key(KeyCode::KEY_PAUSE), Some(Key::Pause));
     }
 
     #[test]

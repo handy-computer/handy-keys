@@ -6,12 +6,14 @@ use crate::types::{Key, Modifiers};
 #[allow(dead_code)]
 mod vk {
     // Control keys
+    pub const CANCEL: u16 = 0x03; // Ctrl+Pause / Ctrl+Break
     pub const BACK: u16 = 0x08;
     pub const TAB: u16 = 0x09;
     pub const RETURN: u16 = 0x0D;
     pub const SHIFT: u16 = 0x10;
     pub const CONTROL: u16 = 0x11;
     pub const MENU: u16 = 0x12; // Alt
+    pub const PAUSE: u16 = 0x13; // Pause/Break
     pub const CAPITAL: u16 = 0x14; // Caps Lock
     pub const ESCAPE: u16 = 0x1B;
     pub const SPACE: u16 = 0x20;
@@ -320,6 +322,8 @@ fn vk_to_key(vk_code: u16, is_extended: bool) -> Option<Key> {
         vk::BACK => Some(Key::Delete), // Backspace
         vk::DELETE => Some(Key::ForwardDelete),
         vk::INSERT => Some(Key::Insert),
+        vk::PAUSE => Some(Key::Pause),
+        vk::CANCEL => Some(Key::Pause), // Ctrl+Pause
         vk::TAB => Some(Key::Tab),
         vk::ESCAPE => Some(Key::Escape),
         vk::SPACE => Some(Key::Space),
@@ -476,6 +480,17 @@ mod tests {
         assert_eq!(map_key(vk::F22, 0, false), Some(Key::F22));
         assert_eq!(map_key(vk::F23, 0, false), Some(Key::F23));
         assert_eq!(map_key(vk::F24, 0, false), Some(Key::F24));
+    }
+
+    #[test]
+    fn pause_and_ctrl_pause_map_to_pause() {
+        // Pause/Break key: virtual key VK_PAUSE (0x13), scancode 0x46.
+        assert_eq!(map_key(vk::PAUSE, 0x46, false), Some(Key::Pause));
+        // Windows quirk: while Ctrl is held, it rewrites Pause's virtual key
+        // from VK_PAUSE (0x13) to VK_CANCEL (0x03), an old behavior of using
+        // Ctrl+Break to cancel. Mapping VK_CANCEL back to Pause lets a
+        // Ctrl+Pause hotkey resolve to Key::Pause with the held Ctrl modifier.
+        assert_eq!(map_key(vk::CANCEL, 0x46, false), Some(Key::Pause));
     }
 
     #[test]
