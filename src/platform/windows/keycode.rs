@@ -484,13 +484,15 @@ mod tests {
 
     #[test]
     fn pause_and_ctrl_pause_map_to_pause() {
-        // Pause/Break key: virtual key VK_PAUSE (0x13), scancode 0x46.
-        assert_eq!(map_key(vk::PAUSE, 0x46, false), Some(Key::Pause));
+        // Pause/Break key: virtual key VK_PAUSE (0x13), scancode 0x45
+        // (make sequence E1 1D 45 — E1-prefixed, so not extended).
+        assert_eq!(map_key(vk::PAUSE, 0x45, false), Some(Key::Pause));
         // Windows quirk: while Ctrl is held, it rewrites Pause's virtual key
         // from VK_PAUSE (0x13) to VK_CANCEL (0x03), an old behavior of using
-        // Ctrl+Break to cancel. Mapping VK_CANCEL back to Pause lets a
+        // Ctrl+Break to cancel. The scancode changes too: E0 46, so 0x46
+        // with the extended flag set. Mapping VK_CANCEL back to Pause lets a
         // Ctrl+Pause hotkey resolve to Key::Pause with the held Ctrl modifier.
-        assert_eq!(map_key(vk::CANCEL, 0x46, false), Some(Key::Pause));
+        assert_eq!(map_key(vk::CANCEL, 0x46, true), Some(Key::Pause));
     }
 
     #[test]
