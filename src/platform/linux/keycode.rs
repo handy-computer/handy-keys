@@ -144,6 +144,17 @@ pub fn key_code_to_key(code: KeyCode) -> Option<Key> {
         KeyCode::KEY_SCROLLLOCK => Some(Key::ScrollLock),
         KeyCode::KEY_NUMLOCK => Some(Key::NumLock),
 
+        // Pause/Break. USB keyboards report real press/release through
+        // evdev; PS/2 (atkbd) delivers the release with the press because
+        // the hardware break sequence is part of the make sequence.
+        KeyCode::KEY_PAUSE => Some(Key::Pause),
+
+        // PrintScreen (the kernel names its event code after SysRq)
+        KeyCode::KEY_SYSRQ => Some(Key::PrintScreen),
+
+        // Context-menu (Application) key
+        KeyCode::KEY_COMPOSE => Some(Key::ContextMenu),
+
         // Mouse buttons
         KeyCode::BTN_LEFT => Some(Key::MouseLeft),
         KeyCode::BTN_RIGHT => Some(Key::MouseRight),
@@ -180,6 +191,12 @@ mod tests {
         assert_eq!(key_code_to_key(KeyCode::KEY_SPACE), Some(Key::Space));
         assert_eq!(key_code_to_key(KeyCode::KEY_ENTER), Some(Key::Return));
         assert_eq!(key_code_to_key(KeyCode::KEY_INSERT), Some(Key::Insert));
+        assert_eq!(key_code_to_key(KeyCode::KEY_PAUSE), Some(Key::Pause));
+        assert_eq!(key_code_to_key(KeyCode::KEY_SYSRQ), Some(Key::PrintScreen));
+        assert_eq!(
+            key_code_to_key(KeyCode::KEY_COMPOSE),
+            Some(Key::ContextMenu)
+        );
     }
 
     #[test]

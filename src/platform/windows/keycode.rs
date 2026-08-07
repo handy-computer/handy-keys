@@ -6,12 +6,15 @@ use crate::types::{Key, Modifiers};
 #[allow(dead_code)]
 mod vk {
     // Control keys
+    pub const CANCEL: u16 = 0x03; // Ctrl+Pause (Break)
     pub const BACK: u16 = 0x08;
     pub const TAB: u16 = 0x09;
+    pub const CLEAR: u16 = 0x0C; // numpad 5 with NumLock off
     pub const RETURN: u16 = 0x0D;
     pub const SHIFT: u16 = 0x10;
     pub const CONTROL: u16 = 0x11;
     pub const MENU: u16 = 0x12; // Alt
+    pub const PAUSE: u16 = 0x13;
     pub const CAPITAL: u16 = 0x14; // Caps Lock
     pub const ESCAPE: u16 = 0x1B;
     pub const SPACE: u16 = 0x20;
@@ -29,6 +32,7 @@ mod vk {
     pub const UP: u16 = 0x26;
     pub const RIGHT: u16 = 0x27;
     pub const DOWN: u16 = 0x28;
+    pub const SNAPSHOT: u16 = 0x2C; // PrintScreen
     pub const INSERT: u16 = 0x2D;
     pub const DELETE: u16 = 0x2E;
 
@@ -38,6 +42,7 @@ mod vk {
     // Windows keys
     pub const LWIN: u16 = 0x5B;
     pub const RWIN: u16 = 0x5C;
+    pub const APPS: u16 = 0x5D; // context-menu (Application) key
 
     // Numpad keys
     pub const NUMPAD0: u16 = 0x60;
@@ -285,6 +290,10 @@ fn vk_to_key(vk_code: u16, is_extended: bool) -> Option<Key> {
         vk::SUBTRACT => Some(Key::KeypadMinus),
         vk::DECIMAL => Some(Key::KeypadDecimal),
         vk::DIVIDE => Some(Key::KeypadDivide),
+        // Numpad 5 with NumLock off reports VK_CLEAR (the other numpad keys
+        // report their nav VKs and map to the nav keys above). KeypadClear
+        // is that function's closest Key — macOS's Clear key maps there too.
+        vk::CLEAR => Some(Key::KeypadClear),
 
         // Return - extended flag means numpad enter
         vk::RETURN if is_extended => Some(Key::KeypadEnter),
@@ -331,6 +340,10 @@ fn vk_to_key(vk_code: u16, is_extended: bool) -> Option<Key> {
         vk::UP => Some(Key::UpArrow),
         vk::RIGHT => Some(Key::RightArrow),
         vk::DOWN => Some(Key::DownArrow),
+        // Alt+PrtScn changes the scancode but keeps VK_SNAPSHOT, so both
+        // reach this arm.
+        vk::SNAPSHOT => Some(Key::PrintScreen),
+        vk::APPS => Some(Key::ContextMenu),
 
         // Punctuation (OEM keys - US layout interpretation; normally
         // superseded by the positional mapping in `map_key`)
@@ -352,6 +365,13 @@ fn vk_to_key(vk_code: u16, is_extended: bool) -> Option<Key> {
         vk::CAPITAL => Some(Key::CapsLock),
         vk::NUMLOCK => Some(Key::NumLock),
         vk::SCROLL => Some(Key::ScrollLock),
+
+        // Pause/Break. The hardware break sequence arrives with the make,
+        // so key-up follows key-down immediately on press (see the
+        // `Key::Pause` docs). Ctrl+Pause reports VK_CANCEL instead of
+        // VK_PAUSE; map both so the key matches with or without Ctrl.
+        vk::PAUSE => Some(Key::Pause),
+        vk::CANCEL => Some(Key::Pause),
 
         _ => None,
     }
@@ -476,6 +496,30 @@ mod tests {
         assert_eq!(map_key(vk::F22, 0, false), Some(Key::F22));
         assert_eq!(map_key(vk::F23, 0, false), Some(Key::F23));
         assert_eq!(map_key(vk::F24, 0, false), Some(Key::F24));
+    }
+
+    #[test]
+    fn pause_maps_from_both_vks() {
+        // Bare Pause: VK_PAUSE with scancode 0x45 (E1-prefixed sequence,
+        // extended flag not set).
+        assert_eq!(map_key(vk::PAUSE, 0x45, false), Some(Key::Pause));
+        // Ctrl+Pause: the driver reports VK_CANCEL with E0 46.
+        assert_eq!(map_key(vk::CANCEL, 0x46, true), Some(Key::Pause));
+    }
+
+    #[test]
+    fn printscreen_and_context_menu_map() {
+        // PrtScn: VK_SNAPSHOT, E0 37. Alt+PrtScn: same VK, scancode 0x54.
+        assert_eq!(map_key(vk::SNAPSHOT, 0x37, true), Some(Key::PrintScreen));
+        assert_eq!(map_key(vk::SNAPSHOT, 0x54, false), Some(Key::PrintScreen));
+        // Context-menu key: VK_APPS, E0 5D.
+        assert_eq!(map_key(vk::APPS, 0x5D, true), Some(Key::ContextMenu));
+    }
+
+    #[test]
+    fn numpad5_without_numlock_maps_to_keypad_clear() {
+        // VK_CLEAR, scancode 0x4C, not extended.
+        assert_eq!(map_key(vk::CLEAR, 0x4C, false), Some(Key::KeypadClear));
     }
 
     #[test]
