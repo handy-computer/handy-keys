@@ -92,7 +92,17 @@ pub enum Key {
     Delete,
     ForwardDelete,
     Insert,
-    /// Pause/Break — PC keyboards only; macOS has no keycode for it.
+    /// The Pause/Break key.
+    ///
+    /// Windows delivers this key's release together with its press: the
+    /// hardware break sequence is part of the make sequence (`E1 1D 45 E1
+    /// 9D C5`, nothing on release — PS/2 behavior the HID driver preserves
+    /// for USB keyboards), so the hook sees key-down and key-up back to
+    /// back at press time. Treat it as tap/toggle only on Windows; a hold
+    /// binding would release immediately. Ctrl+Pause reports `VK_CANCEL`
+    /// rather than `VK_PAUSE`; both map here. Linux evdev reports normal
+    /// press/release for USB keyboards, so holds work there. macOS has no
+    /// virtual keycode for Pause — PC keyboards' Pause key arrives as F15.
     Pause,
     Home,
     End,
@@ -149,6 +159,16 @@ pub enum Key {
     CapsLock,
     ScrollLock,
     NumLock,
+
+    /// The PrintScreen/SysRq key. Windows and Linux only: macOS has no
+    /// virtual keycode for it — PC keyboards' PrintScreen arrives as F13
+    /// there.
+    PrintScreen,
+
+    /// The context-menu (Application) key, right of AltGr on full-size PC
+    /// keyboards. `VK_APPS` on Windows, `KEY_COMPOSE` on Linux evdev;
+    /// macOS reports PC keyboards' Menu key as keycode `0x6E`.
+    ContextMenu,
 
     /// The dictation / voice key (macOS virtual keycode `0xB0`, macOS only).
     ///
@@ -295,6 +315,8 @@ impl fmt::Display for Key {
             Key::CapsLock => write!(f, "CapsLock"),
             Key::ScrollLock => write!(f, "ScrollLock"),
             Key::NumLock => write!(f, "NumLock"),
+            Key::PrintScreen => write!(f, "PrintScreen"),
+            Key::ContextMenu => write!(f, "ContextMenu"),
             Key::MouseLeft => write!(f, "MouseLeft"),
             Key::MouseRight => write!(f, "MouseRight"),
             Key::MouseMiddle => write!(f, "MouseMiddle"),
@@ -448,6 +470,9 @@ impl FromStr for Key {
             "scrolllock" | "scroll" => Ok(Key::ScrollLock),
             "numlock" => Ok(Key::NumLock),
 
+            "printscreen" | "prtsc" | "sysrq" => Ok(Key::PrintScreen),
+            "contextmenu" | "menu" | "apps" | "application" => Ok(Key::ContextMenu),
+
             // Mouse buttons
             "mouseleft" | "leftclick" | "lmb" | "mouse1" => Ok(Key::MouseLeft),
             "mouseright" | "rightclick" | "rmb" | "mouse2" => Ok(Key::MouseRight),
@@ -569,6 +594,8 @@ mod tests {
             Key::Stop,
             Key::PrevTrack,
             Key::NextTrack,
+            Key::PrintScreen,
+            Key::ContextMenu,
         ];
         for key in keys {
             let displayed = format!("{}", key);
@@ -587,6 +614,17 @@ mod tests {
     }
 
     #[test]
+    fn parse_printscreen_and_context_menu() {
+        assert_eq!("printscreen".parse::<Key>().unwrap(), Key::PrintScreen);
+        assert_eq!("prtsc".parse::<Key>().unwrap(), Key::PrintScreen);
+        assert_eq!("sysrq".parse::<Key>().unwrap(), Key::PrintScreen);
+        assert_eq!("contextmenu".parse::<Key>().unwrap(), Key::ContextMenu);
+        assert_eq!("menu".parse::<Key>().unwrap(), Key::ContextMenu);
+        assert_eq!("apps".parse::<Key>().unwrap(), Key::ContextMenu);
+        assert_eq!("application".parse::<Key>().unwrap(), Key::ContextMenu);
+    }
+
+    #[test]
     fn parse_media_keys() {
         // Parsing is case-insensitive and matches the Display spelling.
         assert_eq!("playpause".parse::<Key>().unwrap(), Key::PlayPause);
@@ -602,5 +640,7 @@ mod tests {
         assert_eq!("pause".parse::<Key>().unwrap(), Key::Pause);
         assert_eq!("Pause".parse::<Key>().unwrap(), Key::Pause);
         assert_eq!("break".parse::<Key>().unwrap(), Key::Pause);
+        // "playpause" must keep parsing as the media key, not Pause
+        assert_eq!("playpause".parse::<Key>().unwrap(), Key::PlayPause);
     }
 }
