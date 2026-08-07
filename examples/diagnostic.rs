@@ -21,6 +21,22 @@ use std::time::Instant;
 
 use handy_keys::KeyboardListener;
 
+// Ctrl+Pause arrives as Ctrl+Break in a Windows console, and the default handler
+// terminates the process. Swallow CTRL_BREAK_EVENT so the key reaches the hook.
+#[cfg(target_os = "windows")]
+fn prevent_ctrl_break_termination() {
+    use windows::Win32::Foundation::BOOL;
+    use windows::Win32::System::Console::{SetConsoleCtrlHandler, CTRL_BREAK_EVENT};
+
+    unsafe extern "system" fn handler(ctrl_type: u32) -> BOOL {
+        BOOL::from(ctrl_type == CTRL_BREAK_EVENT)
+    }
+
+    if let Err(e) = unsafe { SetConsoleCtrlHandler(Some(handler), true) } {
+        eprintln!("warning: could not install console Ctrl+Break handler: {e}");
+    }
+}
+
 fn main() -> handy_keys::Result<()> {
     println!(
         "handy-keys {} diagnostic — os={} arch={}",
@@ -30,6 +46,9 @@ fn main() -> handy_keys::Result<()> {
     );
     println!("Press keys to dump events. Ctrl+C to exit.");
     println!();
+
+    #[cfg(target_os = "windows")]
+    prevent_ctrl_break_termination();
 
     let listener = KeyboardListener::new()?;
     let start = Instant::now();
