@@ -92,6 +92,18 @@ pub enum Key {
     Delete,
     ForwardDelete,
     Insert,
+    /// The Pause/Break key.
+    ///
+    /// Windows delivers this key's release together with its press: the
+    /// hardware break sequence is part of the make sequence (`E1 1D 45 E1
+    /// 9D C5`, nothing on release — PS/2 behavior the HID driver preserves
+    /// for USB keyboards), so the hook sees key-down and key-up back to
+    /// back at press time. Treat it as tap/toggle only on Windows; a hold
+    /// binding would release immediately. Ctrl+Pause reports `VK_CANCEL`
+    /// rather than `VK_PAUSE`; both map here. Linux evdev reports normal
+    /// press/release for USB keyboards, so holds work there. macOS has no
+    /// virtual keycode for Pause — PC keyboards' Pause key arrives as F15.
+    Pause,
     Home,
     End,
     PageUp,
@@ -147,19 +159,6 @@ pub enum Key {
     CapsLock,
     ScrollLock,
     NumLock,
-
-    /// The Pause/Break key.
-    ///
-    /// Windows delivers this key's release together with its press: the
-    /// hardware break sequence is part of the make sequence (`E1 1D 45 E1
-    /// 9D C5`, nothing on release — PS/2 behavior the HID driver preserves
-    /// for USB keyboards), so the hook sees key-down and key-up back to
-    /// back at press time. Treat it as tap/toggle only on Windows; a hold
-    /// binding would release immediately. Ctrl+Pause reports `VK_CANCEL`
-    /// rather than `VK_PAUSE`; both map here. Linux evdev reports normal
-    /// press/release for USB keyboards, so holds work there. macOS has no
-    /// virtual keycode for Pause — PC keyboards' Pause key arrives as F15.
-    Pause,
 
     /// The PrintScreen/SysRq key. Windows and Linux only: macOS has no
     /// virtual keycode for it — PC keyboards' PrintScreen arrives as F13
@@ -269,6 +268,7 @@ impl fmt::Display for Key {
             Key::Delete => write!(f, "Delete"),
             Key::ForwardDelete => write!(f, "ForwardDelete"),
             Key::Insert => write!(f, "Insert"),
+            Key::Pause => write!(f, "Pause"),
             Key::Home => write!(f, "Home"),
             Key::End => write!(f, "End"),
             Key::PageUp => write!(f, "PageUp"),
@@ -315,7 +315,6 @@ impl fmt::Display for Key {
             Key::CapsLock => write!(f, "CapsLock"),
             Key::ScrollLock => write!(f, "ScrollLock"),
             Key::NumLock => write!(f, "NumLock"),
-            Key::Pause => write!(f, "Pause"),
             Key::PrintScreen => write!(f, "PrintScreen"),
             Key::ContextMenu => write!(f, "ContextMenu"),
             Key::MouseLeft => write!(f, "MouseLeft"),
@@ -415,6 +414,7 @@ impl FromStr for Key {
             "delete" | "backspace" => Ok(Key::Delete),
             "forwarddelete" | "del" => Ok(Key::ForwardDelete),
             "insert" | "ins" => Ok(Key::Insert),
+            "pause" | "break" => Ok(Key::Pause),
             "home" => Ok(Key::Home),
             "end" => Ok(Key::End),
             "pageup" => Ok(Key::PageUp),
@@ -469,10 +469,6 @@ impl FromStr for Key {
             "capslock" | "caps" => Ok(Key::CapsLock),
             "scrolllock" | "scroll" => Ok(Key::ScrollLock),
             "numlock" => Ok(Key::NumLock),
-
-            // Pause/Break (see the variant docs for the Windows tap-only
-            // caveat)
-            "pause" | "break" => Ok(Key::Pause),
 
             "printscreen" | "prtsc" | "sysrq" => Ok(Key::PrintScreen),
             "contextmenu" | "menu" | "apps" | "application" => Ok(Key::ContextMenu),
@@ -577,6 +573,7 @@ mod tests {
             Key::Return,
             Key::Tab,
             Key::Escape,
+            Key::Pause,
             Key::LeftArrow,
             Key::RightArrow,
             Key::KeypadPlus,
@@ -597,7 +594,6 @@ mod tests {
             Key::Stop,
             Key::PrevTrack,
             Key::NextTrack,
-            Key::Pause,
             Key::PrintScreen,
             Key::ContextMenu,
         ];
@@ -615,15 +611,6 @@ mod tests {
         assert_eq!("globe".parse::<Key>().unwrap(), Key::Dictation);
         // "fn" must keep parsing as the Fn *modifier*, not a key
         assert!("fn".parse::<Key>().is_err());
-    }
-
-    #[test]
-    fn parse_pause_key() {
-        assert_eq!("pause".parse::<Key>().unwrap(), Key::Pause);
-        assert_eq!("Pause".parse::<Key>().unwrap(), Key::Pause);
-        assert_eq!("break".parse::<Key>().unwrap(), Key::Pause);
-        // "playpause" must keep parsing as the media key, not Pause
-        assert_eq!("playpause".parse::<Key>().unwrap(), Key::PlayPause);
     }
 
     #[test]
@@ -645,5 +632,15 @@ mod tests {
         assert_eq!("stop".parse::<Key>().unwrap(), Key::Stop);
         assert_eq!("prevtrack".parse::<Key>().unwrap(), Key::PrevTrack);
         assert_eq!("nexttrack".parse::<Key>().unwrap(), Key::NextTrack);
+    }
+
+    #[test]
+    fn parse_pause_aliases() {
+        // Pause and Break share one physical key on PC hardware.
+        assert_eq!("pause".parse::<Key>().unwrap(), Key::Pause);
+        assert_eq!("Pause".parse::<Key>().unwrap(), Key::Pause);
+        assert_eq!("break".parse::<Key>().unwrap(), Key::Pause);
+        // "playpause" must keep parsing as the media key, not Pause
+        assert_eq!("playpause".parse::<Key>().unwrap(), Key::PlayPause);
     }
 }

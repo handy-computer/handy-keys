@@ -88,6 +88,10 @@ pub fn key_code_to_key(code: KeyCode) -> Option<Key> {
         KeyCode::KEY_BACKSPACE => Some(Key::Delete),
         KeyCode::KEY_DELETE => Some(Key::ForwardDelete),
         KeyCode::KEY_INSERT => Some(Key::Insert),
+        // Pause/Break. USB keyboards report real press/release through
+        // evdev; PS/2 (atkbd) delivers the release with the press because
+        // the hardware break sequence is part of the make sequence.
+        KeyCode::KEY_PAUSE => Some(Key::Pause),
         KeyCode::KEY_HOME => Some(Key::Home),
         KeyCode::KEY_END => Some(Key::End),
         KeyCode::KEY_PAGEUP => Some(Key::PageUp),
@@ -143,11 +147,6 @@ pub fn key_code_to_key(code: KeyCode) -> Option<Key> {
         KeyCode::KEY_CAPSLOCK => Some(Key::CapsLock),
         KeyCode::KEY_SCROLLLOCK => Some(Key::ScrollLock),
         KeyCode::KEY_NUMLOCK => Some(Key::NumLock),
-
-        // Pause/Break. USB keyboards report real press/release through
-        // evdev; PS/2 (atkbd) delivers the release with the press because
-        // the hardware break sequence is part of the make sequence.
-        KeyCode::KEY_PAUSE => Some(Key::Pause),
 
         // PrintScreen (the kernel names its event code after SysRq)
         KeyCode::KEY_SYSRQ => Some(Key::PrintScreen),

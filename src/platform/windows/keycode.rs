@@ -6,7 +6,7 @@ use crate::types::{Key, Modifiers};
 #[allow(dead_code)]
 mod vk {
     // Control keys
-    pub const CANCEL: u16 = 0x03; // Ctrl+Pause (Break)
+    pub const CANCEL: u16 = 0x03; // Ctrl+Pause / Ctrl+Break
     pub const BACK: u16 = 0x08;
     pub const TAB: u16 = 0x09;
     pub const CLEAR: u16 = 0x0C; // numpad 5 with NumLock off
@@ -14,7 +14,7 @@ mod vk {
     pub const SHIFT: u16 = 0x10;
     pub const CONTROL: u16 = 0x11;
     pub const MENU: u16 = 0x12; // Alt
-    pub const PAUSE: u16 = 0x13;
+    pub const PAUSE: u16 = 0x13; // Pause/Break
     pub const CAPITAL: u16 = 0x14; // Caps Lock
     pub const ESCAPE: u16 = 0x1B;
     pub const SPACE: u16 = 0x20;
@@ -329,6 +329,8 @@ fn vk_to_key(vk_code: u16, is_extended: bool) -> Option<Key> {
         vk::BACK => Some(Key::Delete), // Backspace
         vk::DELETE => Some(Key::ForwardDelete),
         vk::INSERT => Some(Key::Insert),
+        vk::PAUSE => Some(Key::Pause),
+        vk::CANCEL => Some(Key::Pause), // Ctrl+Pause
         vk::TAB => Some(Key::Tab),
         vk::ESCAPE => Some(Key::Escape),
         vk::SPACE => Some(Key::Space),
@@ -365,13 +367,6 @@ fn vk_to_key(vk_code: u16, is_extended: bool) -> Option<Key> {
         vk::CAPITAL => Some(Key::CapsLock),
         vk::NUMLOCK => Some(Key::NumLock),
         vk::SCROLL => Some(Key::ScrollLock),
-
-        // Pause/Break. The hardware break sequence arrives with the make,
-        // so key-up follows key-down immediately on press (see the
-        // `Key::Pause` docs). Ctrl+Pause reports VK_CANCEL instead of
-        // VK_PAUSE; map both so the key matches with or without Ctrl.
-        vk::PAUSE => Some(Key::Pause),
-        vk::CANCEL => Some(Key::Pause),
 
         _ => None,
     }
@@ -499,11 +494,15 @@ mod tests {
     }
 
     #[test]
-    fn pause_maps_from_both_vks() {
-        // Bare Pause: VK_PAUSE with scancode 0x45 (E1-prefixed sequence,
-        // extended flag not set).
+    fn pause_and_ctrl_pause_map_to_pause() {
+        // Pause/Break key: virtual key VK_PAUSE (0x13), scancode 0x45
+        // (make sequence E1 1D 45 — E1-prefixed, so not extended).
         assert_eq!(map_key(vk::PAUSE, 0x45, false), Some(Key::Pause));
-        // Ctrl+Pause: the driver reports VK_CANCEL with E0 46.
+        // Windows quirk: while Ctrl is held, it rewrites Pause's virtual key
+        // from VK_PAUSE (0x13) to VK_CANCEL (0x03), an old behavior of using
+        // Ctrl+Break to cancel. The scancode changes too: E0 46, so 0x46
+        // with the extended flag set. Mapping VK_CANCEL back to Pause lets a
+        // Ctrl+Pause hotkey resolve to Key::Pause with the held Ctrl modifier.
         assert_eq!(map_key(vk::CANCEL, 0x46, true), Some(Key::Pause));
     }
 
