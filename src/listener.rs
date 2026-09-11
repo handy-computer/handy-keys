@@ -29,7 +29,7 @@ pub use crate::platform::state::BlockingHotkeys;
 /// Streams all keyboard events. Can optionally block events that match
 /// registered hotkeys.
 pub struct KeyboardListener {
-    event_receiver: Receiver<KeyEvent>,
+    event_receiver: Option<Receiver<KeyEvent>>,
     _thread_handle: Option<JoinHandle<()>>,
     running: Arc<AtomicBool>,
     blocking_hotkeys: Option<BlockingHotkeys>,
@@ -71,7 +71,7 @@ impl KeyboardListener {
             let state = listener::spawn(blocking_hotkeys)?;
             let run_loop = state.run_loop;
             Ok(KeyboardListener {
-                event_receiver: state.event_receiver,
+                event_receiver: Some(state.event_receiver),
                 _thread_handle: state.thread_handle,
                 running: state.running,
                 blocking_hotkeys: state.blocking_hotkeys,
@@ -84,7 +84,7 @@ impl KeyboardListener {
             use crate::platform::windows::listener;
             let state = listener::spawn(blocking_hotkeys)?;
             Ok(KeyboardListener {
-                event_receiver: state.event_receiver,
+                event_receiver: Some(state.event_receiver),
                 _thread_handle: state.thread_handle,
                 running: state.running,
                 blocking_hotkeys: state.blocking_hotkeys,
@@ -97,13 +97,28 @@ impl KeyboardListener {
             use crate::platform::linux::listener;
             let state = listener::spawn(blocking_hotkeys)?;
             Ok(KeyboardListener {
-                event_receiver: state.event_receiver,
+                event_receiver: Some(state.event_receiver),
                 _thread_handle: state.thread_handle,
                 running: state.running,
                 blocking_hotkeys: state.blocking_hotkeys,
                 stop_wakeup: None,
             })
         }
+    }
+
+    /// Take the key event receiver out of the listener.
+    ///
+    /// Lets the caller block on key events from a thread of its own while the
+    /// listener itself stays owned elsewhere — which is what makes it possible
+    /// to shut the listener down: dropping it stops the backend thread, which
+    /// drops the sending half and so wakes the blocked receiver.
+    ///
+    /// Returns `None` if the receiver has already been taken. Afterwards
+    /// [`recv`](Self::recv) and [`recv_timeout`](Self::recv_timeout) return
+    /// [`Error::EventLoopNotRunning`] and [`try_recv`](Self::try_recv) returns
+    /// `None`.
+    pub fn take_event_receiver(&mut self) -> Option<Receiver<KeyEvent>> {
+        self.event_receiver.take()
     }
 
     /// Get a reference to the blocking hotkeys set (if blocking is enabled)
@@ -116,6 +131,8 @@ impl KeyboardListener {
     /// Blocks until a key event is received or the listener stops.
     pub fn recv(&self) -> Result<KeyEvent> {
         self.event_receiver
+            .as_ref()
+            .ok_or(Error::EventLoopNotRunning)?
             .recv()
             .map_err(|_| Error::EventLoopNotRunning)
     }
@@ -125,6 +142,8 @@ impl KeyboardListener {
     /// Blocks until a key event is received, the timeout expires, or the listener stops.
     pub fn recv_timeout(&self, timeout: Duration) -> Result<KeyEvent> {
         self.event_receiver
+            .as_ref()
+            .ok_or(Error::EventLoopNotRunning)?
             .recv_timeout(timeout)
             .map_err(|e| match e {
                 std::sync::mpsc::RecvTimeoutError::Timeout => Error::Timeout,
@@ -136,7 +155,7 @@ impl KeyboardListener {
     ///
     /// Returns `Some(event)` if an event is available, `None` otherwise.
     pub fn try_recv(&self) -> Option<KeyEvent> {
-        match self.event_receiver.try_recv() {
+        match self.event_receiver.as_ref()?.try_recv() {
             Ok(event) => Some(event),
             Err(TryRecvError::Empty) => None,
             Err(TryRecvError::Disconnected) => None,

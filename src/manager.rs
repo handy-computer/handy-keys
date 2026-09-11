@@ -93,7 +93,9 @@ pub struct HotkeyManager {
     state: Arc<Mutex<ManagerState>>,
     event_receiver: Option<Receiver<HotkeyEvent>>,
     _thread_handle: Option<JoinHandle<()>>,
-    running: Arc<std::sync::atomic::AtomicBool>,
+    /// Owned here rather than by the event loop so that `Drop` can stop it:
+    /// dropping the listener ends the loop's blocking `recv`.
+    listener: Option<KeyboardListener>,
     /// Shared set of hotkeys to block
     blocking_hotkeys: Option<BlockingHotkeys>,
 }
@@ -103,24 +105,27 @@ impl HotkeyManager {
     ///
     /// On macOS, this will check for accessibility permissions and fail if not granted.
     pub fn new() -> Result<Self> {
-        let listener = KeyboardListener::new()?;
+        let mut listener = KeyboardListener::new()?;
 
+        // The loop only needs the receiving end. Leaving the listener itself
+        // here is what lets `Drop` wake the loop; see the `listener` field.
+        let events = listener
+            .take_event_receiver()
+            .ok_or(Error::EventLoopNotRunning)?;
         let (tx, rx) = mpsc::channel();
         let state = Arc::new(Mutex::new(ManagerState::new()));
-        let running = Arc::new(std::sync::atomic::AtomicBool::new(true));
 
         let thread_state = Arc::clone(&state);
-        let thread_running = Arc::clone(&running);
 
         let handle = thread::spawn(move || {
-            Self::event_loop(listener, thread_state, tx, thread_running);
+            Self::event_loop(events, thread_state, tx);
         });
 
         Ok(Self {
             state,
             event_receiver: Some(rx),
             _thread_handle: Some(handle),
-            running,
+            listener: Some(listener),
             blocking_hotkeys: None,
         })
     }
@@ -134,57 +139,50 @@ impl HotkeyManager {
     /// and this fails with an actionable error without it.
     pub fn new_with_blocking() -> Result<Self> {
         let blocking_hotkeys: BlockingHotkeys = Arc::new(Mutex::new(HashSet::new()));
-        let listener = KeyboardListener::new_with_blocking(blocking_hotkeys.clone())?;
+        let mut listener = KeyboardListener::new_with_blocking(blocking_hotkeys.clone())?;
 
+        // The loop only needs the receiving end. Leaving the listener itself
+        // here is what lets `Drop` wake the loop; see the `listener` field.
+        let events = listener
+            .take_event_receiver()
+            .ok_or(Error::EventLoopNotRunning)?;
         let (tx, rx) = mpsc::channel();
         let state = Arc::new(Mutex::new(ManagerState::new()));
-        let running = Arc::new(std::sync::atomic::AtomicBool::new(true));
 
         let thread_state = Arc::clone(&state);
-        let thread_running = Arc::clone(&running);
 
         let handle = thread::spawn(move || {
-            Self::event_loop(listener, thread_state, tx, thread_running);
+            Self::event_loop(events, thread_state, tx);
         });
 
         Ok(Self {
             state,
             event_receiver: Some(rx),
             _thread_handle: Some(handle),
-            running,
+            listener: Some(listener),
             blocking_hotkeys: Some(blocking_hotkeys),
         })
     }
 
     /// Event processing loop
     fn event_loop(
-        listener: KeyboardListener,
+        events: Receiver<KeyEvent>,
         state: Arc<Mutex<ManagerState>>,
         sender: Sender<HotkeyEvent>,
-        running: Arc<std::sync::atomic::AtomicBool>,
     ) {
-        const RECV_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(100);
-
-        while running.load(std::sync::atomic::Ordering::SeqCst) {
-            // Block until we receive an event or timeout (to check running flag)
-            match listener.recv_timeout(RECV_TIMEOUT) {
-                Ok(key_event) => {
-                    if let Ok(mut state) = state.lock() {
-                        let hotkey_events = state.process_event(&key_event);
-                        for event in hotkey_events {
-                            if sender.send(event).is_err() {
-                                // Receiver dropped, exit
-                                return;
-                            }
-                        }
+        // Blocks, and so costs nothing while the keyboard is idle. This used to
+        // wake every 100ms purely to re-read a `running` flag, which on a
+        // long-lived process added up to minutes of pure wakeup overhead.
+        // Shutdown now arrives as a channel disconnect instead: `Drop` drops the
+        // listener, the backend thread stops, and the sending half goes away.
+        while let Ok(key_event) = events.recv() {
+            if let Ok(mut state) = state.lock() {
+                let hotkey_events = state.process_event(&key_event);
+                for event in hotkey_events {
+                    if sender.send(event).is_err() {
+                        // Receiver dropped, exit
+                        return;
                     }
-                }
-                Err(crate::error::Error::Timeout) => {
-                    // No event received, loop continues to check running flag
-                }
-                Err(_) => {
-                    // Listener disconnected, exit
-                    return;
                 }
             }
         }
@@ -306,8 +304,11 @@ impl HotkeyManager {
 
 impl Drop for HotkeyManager {
     fn drop(&mut self) {
-        self.running
-            .store(false, std::sync::atomic::Ordering::SeqCst);
+        // Order matters. Dropping the listener stops the backend thread, which
+        // drops the sending half of the key-event channel and so ends the event
+        // loop's blocking `recv`. Joining first would wait for a loop that has
+        // not been told to stop.
+        self.listener = None;
         // Join the thread to ensure clean shutdown
         if let Some(handle) = self._thread_handle.take() {
             let _ = handle.join();
