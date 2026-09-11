@@ -81,6 +81,64 @@ mod macos {
             "did not observe injected F20 key-up"
         );
     }
+
+    /// Covers both halves of the blocking redesign at once: a hotkey event
+    /// still arrives on a receiver that has been taken out of the manager, and
+    /// dropping the manager afterwards returns promptly. The latter is the real
+    /// risk — the event loop now waits with no timeout, so it can only stop if
+    /// dropping the listener disconnects the channel underneath it.
+    #[test]
+    #[ignore = "needs accessibility permission; run: cargo test --test synthetic_input -- --ignored"]
+    fn taken_receiver_delivers_hotkeys_and_drop_returns() {
+        use handy_keys::{Hotkey, HotkeyManager, HotkeyState, Modifiers};
+        use std::sync::mpsc::RecvTimeoutError;
+
+        let mut manager = HotkeyManager::new().expect(
+            "HotkeyManager::new failed — grant accessibility permission to the \
+             terminal running this test (System Settings > Privacy & Security > Accessibility)",
+        );
+
+        let events = manager
+            .take_event_receiver()
+            .expect("the event receiver should be available before it is taken");
+        assert!(
+            manager.take_event_receiver().is_none(),
+            "the event receiver must only be handed out once"
+        );
+
+        let hotkey = Hotkey::new(Modifiers::empty(), Key::F20).expect("F20 is a valid hotkey");
+        manager.register(hotkey).expect("failed to register F20");
+
+        post_f20(true);
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut saw_press = false;
+        while let Some(remaining) = deadline.checked_duration_since(Instant::now()) {
+            match events.recv_timeout(remaining) {
+                // Skip anything the tester's own keyboard produced.
+                Ok(event) => {
+                    if event.state == HotkeyState::Pressed {
+                        saw_press = true;
+                        break;
+                    }
+                }
+                Err(RecvTimeoutError::Timeout) => break,
+                Err(RecvTimeoutError::Disconnected) => {
+                    panic!("event loop stopped before the hotkey arrived")
+                }
+            }
+        }
+        post_f20(false);
+        assert!(saw_press, "no Pressed hotkey event for the injected F20");
+
+        let start = Instant::now();
+        drop(manager);
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "dropping HotkeyManager blocked for {elapsed:?}; the event loop was not woken"
+        );
+    }
 }
 
 #[cfg(target_os = "linux")]
