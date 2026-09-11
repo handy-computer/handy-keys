@@ -91,7 +91,7 @@ impl ManagerState {
 /// (non-blocked keystrokes are re-injected through it).
 pub struct HotkeyManager {
     state: Arc<Mutex<ManagerState>>,
-    event_receiver: Receiver<HotkeyEvent>,
+    event_receiver: Option<Receiver<HotkeyEvent>>,
     _thread_handle: Option<JoinHandle<()>>,
     running: Arc<std::sync::atomic::AtomicBool>,
     /// Shared set of hotkeys to block
@@ -118,7 +118,7 @@ impl HotkeyManager {
 
         Ok(Self {
             state,
-            event_receiver: rx,
+            event_receiver: Some(rx),
             _thread_handle: Some(handle),
             running,
             blocking_hotkeys: None,
@@ -149,7 +149,7 @@ impl HotkeyManager {
 
         Ok(Self {
             state,
-            event_receiver: rx,
+            event_receiver: Some(rx),
             _thread_handle: Some(handle),
             running,
             blocking_hotkeys: Some(blocking_hotkeys),
@@ -256,6 +256,8 @@ impl HotkeyManager {
     /// Blocks until a hotkey event is received or the event loop stops.
     pub fn recv(&self) -> Result<HotkeyEvent> {
         self.event_receiver
+            .as_ref()
+            .ok_or(Error::EventLoopNotRunning)?
             .recv()
             .map_err(|_| Error::EventLoopNotRunning)
     }
@@ -264,11 +266,31 @@ impl HotkeyManager {
     ///
     /// Returns `Some(event)` if an event is available, `None` otherwise.
     pub fn try_recv(&self) -> Option<HotkeyEvent> {
-        match self.event_receiver.try_recv() {
+        match self.event_receiver.as_ref()?.try_recv() {
             Ok(event) => Some(event),
             Err(TryRecvError::Empty) => None,
             Err(TryRecvError::Disconnected) => None,
         }
+    }
+
+    /// Take the hotkey event receiver out of the manager.
+    ///
+    /// `HotkeyManager` owns an [`mpsc::Receiver`], which is `!Sync`, so the
+    /// manager as a whole cannot be shared between threads. That forces callers
+    /// who need to both receive events and register hotkeys to poll
+    /// [`try_recv`](Self::try_recv) on a timer from a single thread, which costs
+    /// a wakeup per poll interval for the life of the process.
+    ///
+    /// Taking the receiver lifts that restriction: move it to a thread of its
+    /// own and block on it, while the manager stays where it is and keeps
+    /// serving [`register`](Self::register) and
+    /// [`unregister`](Self::unregister). Those paths never touch the receiver.
+    ///
+    /// Returns `None` if the receiver has already been taken. Afterwards
+    /// [`recv`](Self::recv) returns [`Error::EventLoopNotRunning`] and
+    /// [`try_recv`](Self::try_recv) returns `None`.
+    pub fn take_event_receiver(&mut self) -> Option<Receiver<HotkeyEvent>> {
+        self.event_receiver.take()
     }
 
     /// Get the number of currently registered hotkeys
@@ -297,6 +319,17 @@ impl Drop for HotkeyManager {
 mod tests {
     use super::*;
     use crate::types::{Key, Modifiers};
+
+    /// The point of `take_event_receiver` is that the receiver can be moved to
+    /// a thread of its own. `HotkeyManager` itself cannot: it owns this
+    /// receiver, and `Receiver<T>` is `!Sync`. Constructing a real manager
+    /// needs accessibility permission, so pin the property rather than the
+    /// call.
+    #[test]
+    fn taken_event_receiver_is_send() {
+        fn assert_send<T: Send>() {}
+        assert_send::<Receiver<HotkeyEvent>>();
+    }
 
     fn make_key_event(modifiers: Modifiers, key: Option<Key>, is_key_down: bool) -> KeyEvent {
         KeyEvent {
