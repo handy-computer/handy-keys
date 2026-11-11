@@ -461,10 +461,15 @@ fn run_event_tap(
 
     let callback: CGEventTapCallBack = Some(event_tap_callback);
 
-    // Use Default mode (not ListenOnly) to enable optional event blocking
+    // Use Default mode (not ListenOnly) to enable optional event blocking.
+    // Annotated-session point, not plain session: events posted at
+    // kCGAnnotatedSessionEventTap never reach a session-level tap, so a
+    // session tap can neither observe nor consume them. Keys remapped
+    // onto the annotated path (Vorssaint Super Key, per cjpais/Handy#2437)
+    // would bypass a session-level tap entirely.
     let tap: Option<CFRetained<CFMachPort>> = unsafe {
         CGEvent::tap_create(
-            CGEventTapLocation::SessionEventTap,
+            CGEventTapLocation::AnnotatedSessionEventTap,
             CGEventTapPlacement::HeadInsertEventTap,
             CGEventTapOptions::Default,
             event_mask,
@@ -646,7 +651,7 @@ mod tests {
         }
         unsafe {
             CGEvent::tap_create(
-                CGEventTapLocation::SessionEventTap,
+                CGEventTapLocation::AnnotatedSessionEventTap,
                 CGEventTapPlacement::HeadInsertEventTap,
                 CGEventTapOptions::ListenOnly,
                 1 << CGEventType::KeyDown.0,
