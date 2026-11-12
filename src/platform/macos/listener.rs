@@ -468,8 +468,11 @@ fn run_event_tap(
     // post there (suspected for the Vorssaint Super Key report,
     // cjpais/Handy#2437, unconfirmed) would bypass a session tap entirely.
     // Trade-off: the annotated point sits downstream of every session-level
-    // tap, so a consumed key is withheld from apps further down but stays
-    // visible to listeners already upstream of us.
+    // tap and of system hotkey dispatch. A consumed key is withheld from
+    // apps further down but stays visible to upstream listeners, and a key
+    // matching a system hotkey (measured: Cmd+Space is seen by session
+    // taps, not by this tap) never reaches here, so colliding shortcuts
+    // stop firing rather than outrank the system action.
     let tap: Option<CFRetained<CFMachPort>> = unsafe {
         CGEvent::tap_create(
             CGEventTapLocation::AnnotatedSessionEventTap,
