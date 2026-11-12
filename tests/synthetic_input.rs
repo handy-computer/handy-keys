@@ -81,6 +81,39 @@ mod macos {
             "did not observe injected F20 key-up"
         );
     }
+
+    /// Posts F20 at the annotated-session point, the path key remappers
+    /// use when re-injecting keys (cjpais/Handy#2437). A session-level tap
+    /// cannot observe posts made there, so this test fails unless the
+    /// production tap sits at the annotated point. It is the regression
+    /// test for that location choice.
+    #[test]
+    #[ignore = "needs accessibility permission; run: cargo test --test synthetic_input -- --ignored"]
+    fn annotated_post_reaches_listener() {
+        let listener = KeyboardListener::new().expect(
+            "KeyboardListener::new failed — grant accessibility permission to the \
+             terminal running this test (System Settings > Privacy & Security > Accessibility)",
+        );
+
+        let post_f20_annotated = |key_down: bool| {
+            let source = CGEventSource::new(CGEventSourceStateID::HIDSystemState);
+            let event = CGEvent::new_keyboard_event(source.as_deref(), VK_F20, key_down)
+                .expect("failed to create keyboard event");
+            CGEvent::post(CGEventTapLocation::AnnotatedSessionEventTap, Some(&event));
+        };
+
+        post_f20_annotated(true);
+        assert!(
+            saw_key_event(&listener, Key::F20, true, Duration::from_secs(2)),
+            "did not observe F20 key-down posted at the annotated point"
+        );
+
+        post_f20_annotated(false);
+        assert!(
+            saw_key_event(&listener, Key::F20, false, Duration::from_secs(2)),
+            "did not observe F20 key-up posted at the annotated point"
+        );
+    }
 }
 
 #[cfg(target_os = "linux")]
