@@ -1,6 +1,7 @@
 //! macOS keyboard listener using CGEventTap
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 use std::ffi::c_void;
 use std::ptr::NonNull;
 use std::sync::atomic::AtomicBool;
@@ -147,14 +148,73 @@ fn reconcile_modifiers(current: &mut Modifiers, flags: CGEventFlags) {
     }
 }
 
+/// Which part of a key press a KeyDown/KeyUp event is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PressPhase {
+    /// The initial key-down.
+    Down,
+    /// An autorepeat key-down.
+    Repeat,
+    /// The key-up.
+    Up,
+}
+
+/// Blocking decisions per key press: the initial key-down decides, and that
+/// press's autorepeats and key-up get the same answer, whatever the modifiers
+/// are by then. Mirrors the Linux backend's `blocked_keys`.
+///
+/// Judging every event on its own modifiers splits a press between us and the
+/// focused app as soon as the modifiers change mid-press: releasing Cmd before
+/// Space leaked an orphan Space key-up, and a modifier dropped while the key
+/// was held let its autorepeats through, typing spaces while the hotkey was
+/// still pressed (cjpais/Handy#2228). The reverse also happened: a press that
+/// passed could have its key-up blocked, leaving the key stuck down in the app.
+///
+/// A press whose key-down we never saw (the listener started mid-press, or the
+/// tap was disabled) has no decision; its events are judged on their own
+/// modifiers, exactly as before.
+#[derive(Debug, Default)]
+struct PressBlocking {
+    /// Keycode of each press in progress -> whether it is blocked.
+    decided: HashMap<u16, bool>,
+}
+
+impl PressBlocking {
+    /// Whether to block this event. `matches_hotkey`: whether the event, judged
+    /// on its own modifiers, matches a blocking hotkey.
+    fn decide(&mut self, keycode: u16, phase: PressPhase, matches_hotkey: bool) -> bool {
+        match phase {
+            PressPhase::Down => {
+                // A fresh press always decides anew, which also replaces a
+                // stale decision left by a key-up we missed.
+                self.decided.insert(keycode, matches_hotkey);
+                matches_hotkey
+            }
+            PressPhase::Repeat => self
+                .decided
+                .get(&keycode)
+                .copied()
+                .unwrap_or(matches_hotkey),
+            PressPhase::Up => self.decided.remove(&keycode).unwrap_or(matches_hotkey),
+        }
+    }
+
+    /// Forget every press in progress. Used when the tap was disabled: key
+    /// events may have been missed, so recorded decisions can be stale.
+    fn forget_all(&mut self) {
+        self.decided.clear();
+    }
+}
+
 /// Context handed to the event tap callback through the refcon pointer.
 ///
 /// `tap` is filled in right after `CGEventTapCreate` returns. The callback and
 /// `run_event_tap` execute on the same thread (callbacks only fire while that
-/// thread runs its run loop), so a plain `Cell` is sound.
+/// thread runs its run loop), so a plain `Cell`/`RefCell` is sound.
 struct CallbackCtx {
     state: Arc<Mutex<ListenerState>>,
     tap: Cell<Option<NonNull<CFMachPort>>>,
+    presses: RefCell<PressBlocking>,
 }
 
 /// The callback function for the event tap
@@ -183,6 +243,9 @@ unsafe extern "C-unwind" fn event_tap_callback(
         if let Some(tap) = ctx.tap.get() {
             CGEvent::tap_enable(tap.as_ref(), true);
         }
+        // Key events may have been missed while disabled; forget per-press
+        // decisions so they cannot apply to a later, unrelated press.
+        ctx.presses.borrow_mut().forget_all();
         // Reconcile modifiers: we may have missed events while disabled.
         if let Ok(mut state) = ctx.state.lock() {
             reconcile_modifiers(
@@ -230,8 +293,20 @@ unsafe extern "C-unwind" fn event_tap_callback(
                     return event.as_ptr();
                 }
 
-                // Check if this should be blocked
-                should_block = state.should_block(modifiers, key);
+                let phase = if CGEvent::integer_value_field(
+                    Some(cg_event),
+                    CGEventField::KeyboardEventAutorepeat,
+                ) != 0
+                {
+                    PressPhase::Repeat
+                } else {
+                    PressPhase::Down
+                };
+                should_block = ctx.presses.borrow_mut().decide(
+                    keycode,
+                    phase,
+                    state.should_block(modifiers, key),
+                );
 
                 let _ = state.event_sender.send(KeyEvent {
                     modifiers,
@@ -253,8 +328,12 @@ unsafe extern "C-unwind" fn event_tap_callback(
                     return event.as_ptr();
                 }
 
-                // Block key up if we blocked key down (to be consistent)
-                should_block = state.should_block(modifiers, key);
+                // Block the key-up iff its key-down was blocked
+                should_block = ctx.presses.borrow_mut().decide(
+                    keycode,
+                    PressPhase::Up,
+                    state.should_block(modifiers, key),
+                );
 
                 let _ = state.event_sender.send(KeyEvent {
                     modifiers,
@@ -457,6 +536,7 @@ fn run_event_tap(
     let ctx_ptr = Box::into_raw(Box::new(CallbackCtx {
         state: Arc::clone(&state),
         tap: Cell::new(None),
+        presses: RefCell::new(PressBlocking::default()),
     }));
 
     let callback: CGEventTapCallBack = Some(event_tap_callback);
@@ -661,6 +741,7 @@ mod tests {
         CallbackCtx {
             state: Arc::new(Mutex::new(ListenerState::new(tx, None))),
             tap: Cell::new(Some(NonNull::from(&**tap))),
+            presses: RefCell::new(PressBlocking::default()),
         }
     }
 
@@ -749,6 +830,219 @@ mod tests {
             ctx.state.lock().unwrap().current_modifiers,
             Modifiers::empty(),
             "stale modifiers must be reconciled away on tap-disable"
+        );
+    }
+
+    // ---- Per-press blocking (cjpais/Handy#2228) ----
+    //
+    // These drive the real tap callback with synthetic CGEvents, so they need
+    // no accessibility permission and run everywhere.
+
+    const VK_SPACE: u16 = 0x31;
+    const VK_A: u16 = 0x00;
+
+    /// Super-key style modifiers: added to key events' flags, with no
+    /// FlagsChanged events (what Vorssaint and similar remappers do).
+    fn hyper() -> CGEventFlags {
+        CGEventFlags::MaskControl
+            | CGEventFlags::MaskAlternate
+            | CGEventFlags::MaskShift
+            | CGEventFlags::MaskCommand
+    }
+
+    fn blocking_ctx(hotkeys: &[&str]) -> (CallbackCtx, Receiver<KeyEvent>, BlockingHotkeys) {
+        let (tx, rx) = mpsc::channel();
+        let set: BlockingHotkeys = Arc::new(Mutex::new(
+            hotkeys
+                .iter()
+                .map(|h| h.parse().expect("hotkey parses"))
+                .collect(),
+        ));
+        let ctx = CallbackCtx {
+            state: Arc::new(Mutex::new(ListenerState::new(tx, Some(Arc::clone(&set))))),
+            tap: Cell::new(None),
+            presses: RefCell::new(PressBlocking::default()),
+        };
+        (ctx, rx, set)
+    }
+
+    /// Deliver one keyboard event to the callback; returns whether it was blocked.
+    fn send_key(ctx: &CallbackCtx, keycode: u16, phase: PressPhase, flags: CGEventFlags) -> bool {
+        let event = CGEvent::new_keyboard_event(None, keycode, phase != PressPhase::Up)
+            .expect("failed to create keyboard event");
+        CGEvent::set_flags(Some(&event), flags);
+        CGEvent::set_integer_value_field(
+            Some(&event),
+            CGEventField::KeyboardEventAutorepeat,
+            i64::from(phase == PressPhase::Repeat),
+        );
+        let event_type = if phase == PressPhase::Up {
+            CGEventType::KeyUp
+        } else {
+            CGEventType::KeyDown
+        };
+        let returned = unsafe {
+            event_tap_callback(
+                std::ptr::null_mut(),
+                event_type,
+                NonNull::from(&*event),
+                ctx as *const CallbackCtx as *mut c_void,
+            )
+        };
+        returned.is_null()
+    }
+
+    use PressPhase::{Down, Repeat, Up};
+
+    #[test]
+    fn press_blocking_decision_table() {
+        let mut p = PressBlocking::default();
+        // Blocked press: repeats and key-up follow it.
+        assert!(p.decide(1, Down, true));
+        assert!(p.decide(1, Repeat, false));
+        assert!(p.decide(1, Up, false));
+        // Passed press: repeats and key-up follow it.
+        assert!(!p.decide(1, Down, false));
+        assert!(!p.decide(1, Repeat, true));
+        assert!(!p.decide(1, Up, true));
+        // No recorded press: judged on its own, as before.
+        assert!(p.decide(2, Repeat, true));
+        assert!(!p.decide(2, Repeat, false));
+        assert!(p.decide(2, Up, true));
+        assert!(!p.decide(2, Up, false));
+        // Key-up consumes the decision.
+        assert!(p.decide(3, Down, true));
+        assert!(p.decide(3, Up, false));
+        assert!(!p.decide(3, Up, false));
+        // Keys are independent.
+        assert!(p.decide(4, Down, true));
+        assert!(!p.decide(5, Down, false));
+        assert!(p.decide(4, Repeat, false));
+        assert!(!p.decide(5, Repeat, true));
+        // forget_all drops everything.
+        p.forget_all();
+        assert!(p.decided.is_empty());
+    }
+
+    /// cjpais/Handy#2228: the modifiers vanish mid-hold (Vorssaint's watchdog
+    /// stops adding them). The hotkey is still pressed, so its key's repeats
+    /// and key-up must stay blocked instead of typing into the focused app.
+    #[test]
+    fn modifiers_dropping_mid_hold_keep_the_press_blocked() {
+        let (ctx, _rx, _set) = blocking_ctx(&["Ctrl+Opt+Shift+Cmd+Space"]);
+        assert!(send_key(&ctx, VK_SPACE, Down, hyper()));
+        assert!(send_key(&ctx, VK_SPACE, Repeat, hyper()));
+        assert!(
+            send_key(&ctx, VK_SPACE, Repeat, CGEventFlags::empty()),
+            "repeat leaked"
+        );
+        assert!(
+            send_key(&ctx, VK_SPACE, Repeat, CGEventFlags::empty()),
+            "repeat leaked"
+        );
+        assert!(
+            send_key(&ctx, VK_SPACE, Up, CGEventFlags::empty()),
+            "key-up leaked"
+        );
+    }
+
+    /// Releasing the modifier before the key: the key-up belongs to a blocked
+    /// press and must not reach the app as an orphan.
+    #[test]
+    fn modifier_released_first_does_not_leak_key_up() {
+        let (ctx, _rx, _set) = blocking_ctx(&["Cmd+Space"]);
+        assert!(send_key(&ctx, VK_SPACE, Down, CGEventFlags::MaskCommand));
+        assert!(send_key(&ctx, VK_SPACE, Up, CGEventFlags::empty()));
+    }
+
+    /// A press that reached the app keeps reaching it: blocking its key-up
+    /// would leave the key stuck down there.
+    #[test]
+    fn passed_press_is_never_blocked_later() {
+        let (ctx, _rx, _set) = blocking_ctx(&["Cmd+Space"]);
+        assert!(!send_key(&ctx, VK_SPACE, Down, CGEventFlags::empty()));
+        assert!(!send_key(&ctx, VK_SPACE, Repeat, CGEventFlags::MaskCommand));
+        assert!(!send_key(&ctx, VK_SPACE, Up, CGEventFlags::MaskCommand));
+    }
+
+    /// The ordinary case is unchanged.
+    #[test]
+    fn plain_hotkey_press_is_blocked_and_other_keys_pass() {
+        let (ctx, _rx, _set) = blocking_ctx(&["Cmd+Space"]);
+        assert!(send_key(&ctx, VK_SPACE, Down, CGEventFlags::MaskCommand));
+        assert!(send_key(&ctx, VK_SPACE, Repeat, CGEventFlags::MaskCommand));
+        assert!(send_key(&ctx, VK_SPACE, Up, CGEventFlags::MaskCommand));
+
+        assert!(!send_key(&ctx, VK_A, Down, CGEventFlags::MaskCommand));
+        assert!(!send_key(&ctx, VK_A, Up, CGEventFlags::MaskCommand));
+        assert!(!send_key(&ctx, VK_SPACE, Down, CGEventFlags::empty()));
+        assert!(!send_key(&ctx, VK_SPACE, Up, CGEventFlags::empty()));
+    }
+
+    /// A press whose key-down we never saw (listener started mid-hold) has no
+    /// decision; its events are judged on their own modifiers, as before.
+    #[test]
+    fn unseen_press_falls_back_to_modifier_matching() {
+        let (ctx, _rx, _set) = blocking_ctx(&["Cmd+Space"]);
+        assert!(send_key(&ctx, VK_SPACE, Repeat, CGEventFlags::MaskCommand));
+        assert!(!send_key(&ctx, VK_SPACE, Repeat, CGEventFlags::empty()));
+        assert!(!send_key(&ctx, VK_SPACE, Up, CGEventFlags::empty()));
+    }
+
+    /// A missed key-up must not decide a later press: every fresh key-down
+    /// decides anew.
+    #[test]
+    fn fresh_press_decides_anew_after_a_missed_key_up() {
+        let (ctx, _rx, _set) = blocking_ctx(&["Cmd+Space"]);
+        assert!(send_key(&ctx, VK_SPACE, Down, CGEventFlags::MaskCommand));
+        // (key-up lost)
+        assert!(!send_key(&ctx, VK_SPACE, Down, CGEventFlags::empty()));
+        assert!(!send_key(&ctx, VK_SPACE, Repeat, CGEventFlags::empty()));
+        assert!(!send_key(&ctx, VK_SPACE, Up, CGEventFlags::empty()));
+    }
+
+    /// While the tap was disabled events may have been missed, so decisions
+    /// are forgotten and events fall back to modifier matching.
+    #[test]
+    fn tap_disable_forgets_press_decisions() {
+        let (ctx, _rx, _set) = blocking_ctx(&["Cmd+Space"]);
+        assert!(send_key(&ctx, VK_SPACE, Down, CGEventFlags::MaskCommand));
+        deliver_tap_disabled(&ctx, CGEventType::TapDisabledByTimeout);
+        assert!(ctx.presses.borrow().decided.is_empty());
+        assert!(!send_key(&ctx, VK_SPACE, Up, CGEventFlags::empty()));
+    }
+
+    /// Unregistering a hotkey mid-press still blocks that press's key-up, so
+    /// the app never sees a key-up without its key-down.
+    #[test]
+    fn hotkey_unregistered_mid_press_still_blocks_its_key_up() {
+        let (ctx, _rx, set) = blocking_ctx(&["Cmd+Space"]);
+        assert!(send_key(&ctx, VK_SPACE, Down, CGEventFlags::MaskCommand));
+        set.lock().unwrap().clear();
+        assert!(send_key(&ctx, VK_SPACE, Up, CGEventFlags::MaskCommand));
+        // The next press sees the new hotkey set.
+        assert!(!send_key(&ctx, VK_SPACE, Down, CGEventFlags::MaskCommand));
+    }
+
+    /// Only blocking changed: the events reported to the manager are the same
+    /// as before, modifiers included.
+    #[test]
+    fn reported_events_are_unchanged() {
+        let (ctx, rx, _set) = blocking_ctx(&["Cmd+Space"]);
+        send_key(&ctx, VK_SPACE, Down, CGEventFlags::MaskCommand);
+        send_key(&ctx, VK_SPACE, Repeat, CGEventFlags::empty());
+        send_key(&ctx, VK_SPACE, Up, CGEventFlags::empty());
+        let events: Vec<_> = rx
+            .try_iter()
+            .map(|e| (e.key, e.is_key_down, e.modifiers))
+            .collect();
+        assert_eq!(
+            events,
+            vec![
+                (Some(Key::Space), true, Modifiers::CMD_LEFT),
+                (Some(Key::Space), true, Modifiers::empty()),
+                (Some(Key::Space), false, Modifiers::empty()),
+            ]
         );
     }
 }
