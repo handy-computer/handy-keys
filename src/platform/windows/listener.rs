@@ -95,6 +95,12 @@ struct HookContext {
     /// hold defuses the shell's menu heuristic for the whole hold; cleared
     /// once no Win/Alt modifier remains held.
     menu_mask_sent: bool,
+    /// Modifier keys whose press was blocked as (part of) a modifier-only
+    /// hotkey. Their autorepeat presses and their release are blocked too:
+    /// letting repeats through hands the app an Alt down→up pair with nothing
+    /// in between, which reads as a lone Alt tap and activates the menu bar
+    /// (cjpais/Handy#2319).
+    swallowed_modifiers: Modifiers,
 }
 
 thread_local! {
@@ -248,6 +254,7 @@ fn reconcile_modifiers(ctx: &mut HookContext) {
     if !ctx.current_modifiers.intersects(MENU_MODIFIERS) {
         ctx.menu_mask_sent = false;
     }
+    ctx.swallowed_modifiers &= ctx.current_modifiers;
 }
 
 /// Reconcile modifier state from the hook thread's message loop (used on
@@ -406,6 +413,7 @@ pub(crate) fn spawn(blocking_hotkeys: Option<BlockingHotkeys>) -> Result<Windows
                 blocking_hotkeys: thread_blocking,
                 altgr_phantom_ctrl: false,
                 menu_mask_sent: false,
+                swallowed_modifiers: Modifiers::empty(),
             });
         });
 
@@ -569,6 +577,17 @@ unsafe extern "system" fn keyboard_hook_proc(code: i32, wparam: WPARAM, lparam: 
                     should_block =
                         should_block_hotkey(&ctx.blocking_hotkeys, ctx.current_modifiers, None);
 
+                    if is_key_down {
+                        if should_block {
+                            ctx.swallowed_modifiers |= modifier;
+                        }
+                    } else if ctx.swallowed_modifiers.contains(modifier) {
+                        // The app never saw this key go down; don't show it
+                        // the release either.
+                        ctx.swallowed_modifiers &= !modifier;
+                        should_block = true;
+                    }
+
                     // A blocked modifier press (the Shift of a Win+Shift
                     // modifier-only hotkey) is as invisible to the shell as
                     // a blocked regular key, so it needs the same mask.
@@ -583,6 +602,9 @@ unsafe extern "system" fn keyboard_hook_proc(code: i32, wparam: WPARAM, lparam: 
                         is_key_down,
                         changed_modifier: Some(modifier),
                     });
+                } else if is_key_down && ctx.swallowed_modifiers.contains(modifier) {
+                    // Autorepeat of a blocked modifier press.
+                    should_block = true;
                 }
 
                 // The hold ends once no Win/Alt modifier remains held; the
@@ -1070,10 +1092,12 @@ mod tests {
             blocking_hotkeys: None,
             altgr_phantom_ctrl: false,
             menu_mask_sent: true,
+            swallowed_modifiers: Modifiers::CMD_LEFT,
         };
         reconcile_modifiers(&mut ctx);
         assert_eq!(ctx.current_modifiers, Modifiers::empty());
         assert!(!ctx.menu_mask_sent);
+        assert_eq!(ctx.swallowed_modifiers, Modifiers::empty());
         // The stale CMD_LEFT was cleared via a synthetic release event.
         let release = rx.try_recv().expect("expected a synthetic release");
         assert_eq!(release.changed_modifier, Some(Modifiers::CMD_LEFT));
