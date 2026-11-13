@@ -100,6 +100,87 @@ pub fn release_events(tracked: Modifiers, stale: Modifiers) -> Vec<KeyEvent> {
     events
 }
 
+/// Decide whether a modifier key event is hidden from other applications,
+/// updating the set of swallowed modifiers.
+///
+/// The decision is made once, on the press: a press that completes a blocked
+/// modifier-only hotkey is swallowed. It then holds for the whole lifetime
+/// of that press, so its auto-repeats and its release are swallowed too, and
+/// nothing else is. Other applications therefore see either the complete
+/// down/repeat/up sequence of a key or none of it: never a release without a
+/// press (harmless) or, worse, a press without a release (a modifier stuck
+/// down system-wide).
+///
+/// `completes_hotkey` must be false for auto-repeats: a repeat inherits the
+/// decision made for its press.
+#[cfg(any(target_os = "windows", test))]
+pub fn swallow_modifier_event(
+    swallowed: &mut Modifiers,
+    modifier: Modifiers,
+    is_key_down: bool,
+    completes_hotkey: bool,
+) -> bool {
+    if !is_key_down {
+        let was_swallowed = swallowed.contains(modifier);
+        swallowed.remove(modifier);
+        return was_swallowed;
+    }
+    if completes_hotkey {
+        swallowed.insert(modifier);
+    }
+    swallowed.contains(modifier)
+}
+
+#[cfg(test)]
+mod swallow_tests {
+    use super::*;
+
+    const ALT: Modifiers = Modifiers::OPT_RIGHT;
+    const SHIFT: Modifiers = Modifiers::SHIFT_LEFT;
+
+    #[test]
+    fn swallowed_press_takes_its_repeats_and_release_with_it() {
+        // cjpais/Handy#2319: Right Alt alone is the hotkey. Letting the
+        // repeats and the release through hands the app a lone Alt tap.
+        let mut swallowed = Modifiers::empty();
+        assert!(swallow_modifier_event(&mut swallowed, ALT, true, true));
+        assert!(swallow_modifier_event(&mut swallowed, ALT, true, false));
+        assert!(swallow_modifier_event(&mut swallowed, ALT, true, false));
+        assert!(swallow_modifier_event(&mut swallowed, ALT, false, false));
+        assert_eq!(swallowed, Modifiers::empty());
+    }
+
+    #[test]
+    fn passed_press_is_never_swallowed_later() {
+        let mut swallowed = Modifiers::empty();
+        assert!(!swallow_modifier_event(&mut swallowed, SHIFT, true, false));
+        assert!(!swallow_modifier_event(&mut swallowed, SHIFT, true, false));
+        assert!(!swallow_modifier_event(&mut swallowed, SHIFT, false, false));
+        assert_eq!(swallowed, Modifiers::empty());
+    }
+
+    #[test]
+    fn release_follows_its_own_press_not_the_other_keys() {
+        // Shift passed, Alt swallowed: each release follows its own press,
+        // whatever combination the remaining keys happen to form.
+        let mut swallowed = Modifiers::empty();
+        assert!(!swallow_modifier_event(&mut swallowed, SHIFT, true, false));
+        assert!(swallow_modifier_event(&mut swallowed, ALT, true, true));
+        assert!(!swallow_modifier_event(&mut swallowed, SHIFT, false, false));
+        assert_eq!(swallowed, ALT);
+        assert!(swallow_modifier_event(&mut swallowed, ALT, false, false));
+    }
+
+    #[test]
+    fn next_press_after_a_swallowed_one_is_decided_afresh() {
+        let mut swallowed = Modifiers::empty();
+        assert!(swallow_modifier_event(&mut swallowed, ALT, true, true));
+        assert!(swallow_modifier_event(&mut swallowed, ALT, false, false));
+        assert!(!swallow_modifier_event(&mut swallowed, ALT, true, false));
+        assert!(!swallow_modifier_event(&mut swallowed, ALT, false, false));
+    }
+}
+
 #[cfg(all(test, any(target_os = "windows", target_os = "linux")))]
 mod tests {
     use super::*;
