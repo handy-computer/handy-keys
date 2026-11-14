@@ -50,20 +50,122 @@ fn saw_key_event(
 #[cfg(target_os = "macos")]
 mod macos {
     use super::*;
-    use objc2_core_graphics::{CGEvent, CGEventSource, CGEventSourceStateID, CGEventTapLocation};
+    use objc2_core_graphics::{
+        CGEvent, CGEventField, CGEventFlags, CGEventSource, CGEventSourceStateID,
+        CGEventTapLocation,
+    };
 
     const VK_F20: u16 = 0x5A;
 
+    /// Injected events are system-global: a listener in one test sees every
+    /// other test's injections, and two tests interleaving F20 presses split
+    /// each other's presses. Serialize them regardless of --test-threads.
+    static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn serial() -> std::sync::MutexGuard<'static, ()> {
+        SERIAL.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     fn post_f20(key_down: bool) {
+        post_f20_with(key_down, false, CGEventFlags::empty());
+    }
+
+    fn post_f20_with(key_down: bool, autorepeat: bool, flags: CGEventFlags) {
         let source = CGEventSource::new(CGEventSourceStateID::HIDSystemState);
         let event = CGEvent::new_keyboard_event(source.as_deref(), VK_F20, key_down)
             .expect("failed to create keyboard event");
+        CGEvent::set_flags(Some(&event), flags);
+        CGEvent::set_integer_value_field(
+            Some(&event),
+            CGEventField::KeyboardEventAutorepeat,
+            i64::from(autorepeat),
+        );
         CGEvent::post(CGEventTapLocation::HIDEventTap, Some(&event));
+    }
+
+    /// cjpais/Handy#2228, end to end. A modifier remapper (Vorssaint's Super
+    /// Key) adds Ctrl+Opt+Shift+Cmd to key events' flags and can stop adding
+    /// them while the key is still held. The blocked hotkey's repeats and
+    /// key-up must still never reach anything downstream.
+    ///
+    /// The observer is created first and the blocker second: both insert at
+    /// the head of the session taps, so the blocker sees events first and the
+    /// observer sees exactly what the rest of the system would.
+    #[test]
+    #[ignore = "needs accessibility permission; run: cargo test --test synthetic_input -- --ignored"]
+    fn blocked_press_stays_blocked_when_modifiers_drop() {
+        use std::collections::HashSet;
+        use std::sync::{Arc, Mutex};
+
+        use handy_keys::{BlockingHotkeys, Hotkey};
+
+        let _serial = serial();
+
+        let observer = KeyboardListener::new().expect(
+            "KeyboardListener::new failed — grant accessibility permission to the \
+             terminal running this test (System Settings > Privacy & Security > Accessibility)",
+        );
+        let hotkey: Hotkey = "Ctrl+Opt+Shift+Cmd+F20".parse().unwrap();
+        let hotkeys: BlockingHotkeys = Arc::new(Mutex::new(HashSet::from([hotkey])));
+        let blocker = KeyboardListener::new_with_blocking(hotkeys).unwrap();
+
+        let hyper = CGEventFlags::MaskControl
+            | CGEventFlags::MaskAlternate
+            | CGEventFlags::MaskShift
+            | CGEventFlags::MaskCommand;
+        post_f20_with(true, false, hyper);
+        post_f20_with(true, true, hyper);
+        // The remapper lets go of the modifiers mid-hold.
+        post_f20_with(true, true, CGEventFlags::empty());
+        post_f20_with(true, true, CGEventFlags::empty());
+        post_f20_with(false, false, CGEventFlags::empty());
+
+        // Everything the blocker saw, for diagnosing a failure: the first
+        // event must carry the hyper modifiers, or the injection itself lost
+        // them and the test proves nothing.
+        let mut seen = Vec::new();
+        while let Ok(event) = blocker.recv_timeout(Duration::from_millis(500)) {
+            if event.key == Some(Key::F20) {
+                seen.push(event);
+            }
+        }
+        assert_eq!(
+            seen.len(),
+            5,
+            "blocker did not see all 5 injected events: {seen:?}"
+        );
+        assert!(
+            hotkey.modifiers.matches(seen[0].modifiers),
+            "injected key-down lost its modifiers: {seen:?}"
+        );
+        let mut leaked = Vec::new();
+        while let Ok(event) = observer.recv_timeout(Duration::from_millis(200)) {
+            if event.key == Some(Key::F20) {
+                leaked.push(event);
+            }
+        }
+        assert!(
+            leaked.is_empty(),
+            "the blocked press leaked downstream: {leaked:?}\nblocker saw: {seen:?}"
+        );
+
+        // Control: a plain F20 press is not a hotkey and must pass.
+        post_f20(true);
+        assert!(
+            saw_key_event(&observer, Key::F20, true, Duration::from_secs(2)),
+            "unblocked F20 key-down did not pass"
+        );
+        post_f20(false);
+        assert!(
+            saw_key_event(&observer, Key::F20, false, Duration::from_secs(2)),
+            "unblocked F20 key-up did not pass"
+        );
     }
 
     #[test]
     #[ignore = "needs accessibility permission; run: cargo test --test synthetic_input -- --ignored"]
     fn injected_f20_reaches_listener() {
+        let _serial = serial();
         let listener = KeyboardListener::new().expect(
             "KeyboardListener::new failed — grant accessibility permission to the \
              terminal running this test (System Settings > Privacy & Security > Accessibility)",
