@@ -164,6 +164,24 @@ struct CallbackCtx {
     tap: Cell<Option<NonNull<CFMachPort>>>,
 }
 
+/// Event types delivered to the filtering (Default mode) tap. Only events
+/// that `should_block` can swallow belong here: every event in this mask is
+/// held by the system until the callback returns.
+const KEYBOARD_EVENT_MASK: CGEventMask = (1 << CGEventType::KeyDown.0)
+    | (1 << CGEventType::KeyUp.0)
+    | (1 << CGEventType::FlagsChanged.0);
+
+/// Mouse buttons are reported for mouse hotkeys but never blocked, so they go
+/// to a ListenOnly tap. The system does not wait on a ListenOnly tap, so
+/// clicks reach apps even while the callback is busy or stalled
+/// (cjpais/Handy#1758, handy-keys#29).
+const MOUSE_EVENT_MASK: CGEventMask = (1 << CGEventType::LeftMouseDown.0)
+    | (1 << CGEventType::LeftMouseUp.0)
+    | (1 << CGEventType::RightMouseDown.0)
+    | (1 << CGEventType::RightMouseUp.0)
+    | (1 << CGEventType::OtherMouseDown.0)
+    | (1 << CGEventType::OtherMouseUp.0);
+
 /// The callback function for the event tap
 ///
 /// Returns NULL to block the event, or the event pointer to pass it through.
@@ -451,99 +469,130 @@ unsafe extern "C-unwind" fn event_tap_callback(
     }
 }
 
+/// An event tap installed on the current thread's run loop, together with the
+/// callback context it owns.
+struct InstalledTap {
+    tap: CFRetained<CFMachPort>,
+    source: CFRetained<CFRunLoopSource>,
+    ctx_ptr: *mut CallbackCtx,
+}
+
+impl InstalledTap {
+    /// Create a tap and add it to `run_loop`. The tap is left disabled.
+    fn install(
+        state: &Arc<Mutex<ListenerState>>,
+        run_loop: &CFRunLoop,
+        options: CGEventTapOptions,
+        event_mask: CGEventMask,
+    ) -> std::result::Result<Self, String> {
+        // Callback context, handed to the tap as a raw refcon pointer
+        let ctx_ptr = Box::into_raw(Box::new(CallbackCtx {
+            state: Arc::clone(state),
+            tap: Cell::new(None),
+        }));
+
+        let callback: CGEventTapCallBack = Some(event_tap_callback);
+
+        let tap: Option<CFRetained<CFMachPort>> = unsafe {
+            CGEvent::tap_create(
+                CGEventTapLocation::SessionEventTap,
+                CGEventTapPlacement::HeadInsertEventTap,
+                options,
+                event_mask,
+                callback,
+                ctx_ptr as *mut c_void,
+            )
+        };
+
+        let Some(tap) = tap else {
+            unsafe {
+                drop(Box::from_raw(ctx_ptr));
+            }
+            return Err(
+                "Failed to create event tap. Your terminal app may need accessibility permission in System Settings > Privacy & Security > Accessibility".to_string()
+            );
+        };
+
+        // Give the callback the tap port so it can re-enable on TapDisabledBy*
+        // pseudo-events. No race: callbacks only run on this thread's run loop,
+        // which hasn't started yet.
+        unsafe { (*ctx_ptr).tap.set(Some(NonNull::from(&*tap))) };
+
+        let Some(source) = CFMachPort::new_run_loop_source(None, Some(&tap), 0) else {
+            unsafe {
+                CFMachPort::invalidate(&tap);
+                drop(Box::from_raw(ctx_ptr));
+            }
+            return Err("Failed to create run loop source".to_string());
+        };
+
+        run_loop.add_source(Some(&source), unsafe {
+            objc2_core_foundation::kCFRunLoopCommonModes
+        });
+
+        Ok(Self {
+            tap,
+            source,
+            ctx_ptr,
+        })
+    }
+
+    /// Remove the tap from `run_loop`, invalidate it and free its context.
+    fn remove(self, run_loop: &CFRunLoop) {
+        run_loop.remove_source(Some(&self.source), unsafe {
+            objc2_core_foundation::kCFRunLoopCommonModes
+        });
+        CGEvent::tap_enable(&self.tap, false);
+        CFMachPort::invalidate(&self.tap);
+        unsafe {
+            drop(Box::from_raw(self.ctx_ptr));
+        }
+    }
+}
+
 /// Run the event tap in a dedicated thread
 fn run_event_tap(
     state: Arc<Mutex<ListenerState>>,
     running: Arc<AtomicBool>,
     init_tx: Sender<std::result::Result<TapRunLoop, String>>,
 ) {
-    // Event types we want to monitor
-    let event_mask: CGEventMask = (1 << CGEventType::KeyDown.0)
-        | (1 << CGEventType::KeyUp.0)
-        | (1 << CGEventType::FlagsChanged.0)
-        // Mouse buttons
-        | (1 << CGEventType::LeftMouseDown.0)
-        | (1 << CGEventType::LeftMouseUp.0)
-        | (1 << CGEventType::RightMouseDown.0)
-        | (1 << CGEventType::RightMouseUp.0)
-        | (1 << CGEventType::OtherMouseDown.0)
-        | (1 << CGEventType::OtherMouseUp.0);
-
-    // Callback context, handed to the tap as a raw refcon pointer
-    let ctx_ptr = Box::into_raw(Box::new(CallbackCtx {
-        state: Arc::clone(&state),
-        tap: Cell::new(None),
-    }));
-
-    let callback: CGEventTapCallBack = Some(event_tap_callback);
-
-    // Use Default mode (not ListenOnly) to enable optional event blocking
-    let tap: Option<CFRetained<CFMachPort>> = unsafe {
-        CGEvent::tap_create(
-            CGEventTapLocation::SessionEventTap,
-            CGEventTapPlacement::HeadInsertEventTap,
-            CGEventTapOptions::Default,
-            event_mask,
-            callback,
-            ctx_ptr as *mut c_void,
-        )
+    // Get the current run loop. current() should always succeed on a valid thread
+    let Some(run_loop) = CFRunLoop::current() else {
+        let _ = init_tx.send(Err("Failed to get current run loop".to_string()));
+        return;
     };
 
-    let tap = match tap {
-        Some(t) => t,
-        None => {
-            // Cleanup
-            unsafe {
-                drop(Box::from_raw(ctx_ptr));
-            }
-            let _ = init_tx.send(Err(
-                "Failed to create event tap. Your terminal app may need accessibility permission in System Settings > Privacy & Security > Accessibility".to_string()
-            ));
+    // Keyboard events use Default mode (not ListenOnly) to enable optional
+    // event blocking.
+    let keyboard_tap = match InstalledTap::install(
+        &state,
+        &run_loop,
+        CGEventTapOptions::Default,
+        KEYBOARD_EVENT_MASK,
+    ) {
+        Ok(tap) => tap,
+        Err(msg) => {
+            let _ = init_tx.send(Err(msg));
             return;
         }
     };
 
-    // Give the callback the tap port so it can re-enable on TapDisabledBy*
-    // pseudo-events. No race: callbacks only run on this thread's run loop,
-    // which hasn't started yet.
-    unsafe { (*ctx_ptr).tap.set(Some(NonNull::from(&*tap))) };
-
-    // Create run loop source
-    let source: Option<CFRetained<CFRunLoopSource>> =
-        CFMachPort::new_run_loop_source(None, Some(&tap), 0);
-
-    let source = match source {
-        Some(s) => s,
-        None => {
-            unsafe {
-                CFMachPort::invalidate(&tap);
-                drop(Box::from_raw(ctx_ptr));
-            }
-            let _ = init_tx.send(Err("Failed to create run loop source".to_string()));
+    let mouse_tap = match InstalledTap::install(
+        &state,
+        &run_loop,
+        CGEventTapOptions::ListenOnly,
+        MOUSE_EVENT_MASK,
+    ) {
+        Ok(tap) => tap,
+        Err(msg) => {
+            keyboard_tap.remove(&run_loop);
+            let _ = init_tx.send(Err(msg));
             return;
         }
     };
 
-    // Get the current run loop and add the source
-    let run_loop = CFRunLoop::current();
-
-    // Unwrap the Option<CFRetained<CFRunLoop>> - current() should always succeed on a valid thread
-    let run_loop = match run_loop {
-        Some(rl) => rl,
-        None => {
-            unsafe {
-                CFMachPort::invalidate(&tap);
-                drop(Box::from_raw(ctx_ptr));
-            }
-            let _ = init_tx.send(Err("Failed to get current run loop".to_string()));
-            return;
-        }
-    };
-
-    run_loop.add_source(Some(&source), unsafe {
-        objc2_core_foundation::kCFRunLoopCommonModes
-    });
-    CGEvent::tap_enable(&tap, true);
+    CGEvent::tap_enable(&keyboard_tap.tap, true);
+    CGEvent::tap_enable(&mouse_tap.tap, true);
 
     // Signal successful initialization, handing back this thread's run loop
     // so KeyboardListener::drop can stop it.
@@ -556,26 +605,20 @@ fn run_event_tap(
     // and even the bare 100ms cycling cost ~10 mach messages/sec. Tap
     // recovery is event-driven in event_tap_callback; shutdown goes through
     // TapRunLoop::stop. Guarded by `running` in case the loop returns
-    // without a stop request; bail out if the tap's port died (e.g. the
+    // without a stop request; bail out if a tap's port died (e.g. the
     // accessibility permission was revoked) so we don't spin on a dead
     // source.
     while running.load(std::sync::atomic::Ordering::SeqCst) {
         CFRunLoop::run();
 
-        if !CFMachPort::is_valid(&tap) {
+        if !CFMachPort::is_valid(&keyboard_tap.tap) || !CFMachPort::is_valid(&mouse_tap.tap) {
             break;
         }
     }
 
     // Cleanup
-    run_loop.remove_source(Some(&source), unsafe {
-        objc2_core_foundation::kCFRunLoopCommonModes
-    });
-    CGEvent::tap_enable(&tap, false);
-    CFMachPort::invalidate(&tap);
-    unsafe {
-        drop(Box::from_raw(ctx_ptr));
-    }
+    mouse_tap.remove(&run_loop);
+    keyboard_tap.remove(&run_loop);
 }
 
 #[cfg(test)]
