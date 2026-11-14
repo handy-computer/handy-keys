@@ -113,8 +113,10 @@ pub(crate) fn spawn(blocking_hotkeys: Option<BlockingHotkeys>) -> Result<MacOSLi
 /// Reconcile internally tracked modifiers against the actual CGEventFlags from the OS.
 ///
 /// This corrects drift caused by missed events (e.g., tap disabled by timeout, system
-/// interruptions like Mission Control or screen lock). Should only be called for
-/// non-FlagsChanged events, where flags reflect the current state with no change pending.
+/// interruptions like Mission Control or screen lock). It is called for non-FlagsChanged
+/// events, and also at the start of every FlagsChanged event: a listener whose traffic is
+/// only modifier keys (paste with Cmd+V, then press a modifier-only hotkey) would
+/// otherwise never reconcile a release that was lost.
 fn reconcile_modifiers(current: &mut Modifiers, flags: CGEventFlags) {
     // If OS says a modifier group is NOT held, clear our tracked bits.
     // This fixes "stuck modifier" from missed release events.
@@ -130,6 +132,10 @@ fn reconcile_modifiers(current: &mut Modifiers, flags: CGEventFlags) {
     if !flags.contains(CGEventFlags::MaskAlternate) {
         current.remove(Modifiers::OPT_LEFT | Modifiers::OPT_RIGHT);
     }
+    // FN has no side and only ever appears in flags.
+    if !flags_have_fn(flags) {
+        current.remove(Modifiers::FN);
+    }
 
     // If OS says a modifier group IS held but we have no bits for it,
     // we missed a press event. Default to left side as fallback.
@@ -144,6 +150,9 @@ fn reconcile_modifiers(current: &mut Modifiers, flags: CGEventFlags) {
     }
     if flags.contains(CGEventFlags::MaskAlternate) && !current.intersects(Modifiers::OPT) {
         current.insert(Modifiers::OPT_LEFT);
+    }
+    if flags_have_fn(flags) && !current.contains(Modifiers::FN) {
+        current.insert(Modifiers::FN);
     }
 }
 
@@ -287,6 +296,11 @@ unsafe extern "C-unwind" fn event_tap_callback(
 
                 let changed_modifier = keycode_to_modifier(keycode);
 
+                // Modifier-only traffic never reaches the non-FlagsChanged reconcile path, so a
+                // release lost while the tap was disabled (timeout, secure input, lock screen, ...)
+                // would stay tracked forever and modifier-only hotkeys would stop matching.
+                reconcile_modifiers(&mut state.current_modifiers, flags);
+
                 // Check if this is a lock key (e.g., Caps Lock) which comes through
                 // as FlagsChanged but isn't a traditional modifier
                 let lock_key = keycode_to_key(keycode);
@@ -305,10 +319,30 @@ unsafe extern "C-unwind" fn event_tap_callback(
                         changed_modifier: None,
                     });
                 } else if let Some(modifier_bit) = changed_modifier {
-                    // Regular modifier key — use keycode to toggle the specific bit
-                    let was_set = state.current_modifiers.contains(modifier_bit);
-                    let is_key_down = !was_set;
-
+                    // Derive press/release from the event's flags instead of toggling the tracked
+                    // bit: the previous `!was_set` toggle stayed inverted for a key once one of its
+                    // events was missed. FN (keycode 0x3F) also reaches this branch and only exists
+                    // in flags, so it is resolved via `flags_have_fn()`.
+                    //
+                    // CGEventFlags does not distinguish left/right, so this is group-level: when
+                    // both sides of a group are held and one of them is released, the released side
+                    // keeps its bit until the whole group is released. Group matching is unaffected
+                    // (`Modifiers::matches` matches a compound group by any side), and the next
+                    // reconcile clears it.
+                    let group_in_flags = if modifier_bit.intersects(Modifiers::CMD) {
+                        flags.contains(CGEventFlags::MaskCommand)
+                    } else if modifier_bit.intersects(Modifiers::SHIFT) {
+                        flags.contains(CGEventFlags::MaskShift)
+                    } else if modifier_bit.intersects(Modifiers::CTRL) {
+                        flags.contains(CGEventFlags::MaskControl)
+                    } else if modifier_bit.intersects(Modifiers::OPT) {
+                        flags.contains(CGEventFlags::MaskAlternate)
+                    } else if modifier_bit.intersects(Modifiers::FN) {
+                        flags_have_fn(flags)
+                    } else {
+                        false
+                    };
+                    let is_key_down = group_in_flags;
                     if is_key_down {
                         state.current_modifiers |= modifier_bit;
                     } else {
