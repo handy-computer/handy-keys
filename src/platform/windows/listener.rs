@@ -25,7 +25,9 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 
 use crate::error::Result;
-use crate::platform::state::{release_events, stale_modifiers, BlockingHotkeys, RECONCILABLE};
+use crate::platform::state::{
+    release_events, stale_modifiers, swallow_modifier_event, BlockingHotkeys, RECONCILABLE,
+};
 use crate::types::{Key, KeyEvent, Modifiers};
 
 use super::keycode::{is_altgr_phantom_ctrl, map_key, vk_to_modifier};
@@ -95,6 +97,16 @@ struct HookContext {
     /// hold defuses the shell's menu heuristic for the whole hold; cleared
     /// once no Win/Alt modifier remains held.
     menu_mask_sent: bool,
+    /// Modifier keys whose press was blocked as (part of) a modifier-only
+    /// hotkey. Their autorepeat presses and their release are blocked too:
+    /// letting repeats through hands the app an Alt down→up pair with nothing
+    /// in between, which reads as a lone Alt tap and activates the menu bar
+    /// (cjpais/Handy#2319).
+    ///
+    /// A blocked press never reaches the system's async key state, so
+    /// GetAsyncKeyState reports these keys as up for as long as they are
+    /// held. Reconciliation counts them as held instead (cjpais/Handy#2398).
+    swallowed_modifiers: Modifiers,
 }
 
 thread_local! {
@@ -233,9 +245,11 @@ fn reconcile_modifiers(ctx: &mut HookContext) {
     if ctx.altgr_phantom_ctrl && !physical.contains(Modifiers::CTRL_LEFT) {
         ctx.altgr_phantom_ctrl = false;
     }
+    // A swallowed modifier reads as up in the async key state while the
+    // user still holds it; that is our own doing, not a missed release.
     for event in release_events(
         ctx.current_modifiers,
-        stale_modifiers(ctx.current_modifiers, physical),
+        stale_modifiers(ctx.current_modifiers, physical | ctx.swallowed_modifiers),
     ) {
         ctx.current_modifiers = event.modifiers;
         let _ = ctx.event_sender.send(event);
@@ -256,6 +270,10 @@ fn reconcile_modifiers(ctx: &mut HookContext) {
 fn reconcile_modifiers_in_context() {
     HOOK_CONTEXT.with(|ctx_cell| {
         if let Some(ctx) = ctx_cell.borrow_mut().as_mut() {
+            // The release of a swallowed modifier may have happened out of
+            // the hook's sight (secure desktop, suspend). Nothing vouches
+            // for it being held any more, so trust the system alone here.
+            ctx.swallowed_modifiers = Modifiers::empty();
             reconcile_modifiers(ctx);
         }
     });
@@ -406,6 +424,7 @@ pub(crate) fn spawn(blocking_hotkeys: Option<BlockingHotkeys>) -> Result<Windows
                 blocking_hotkeys: thread_blocking,
                 altgr_phantom_ctrl: false,
                 menu_mask_sent: false,
+                swallowed_modifiers: Modifiers::empty(),
             });
         });
 
@@ -563,12 +582,26 @@ unsafe extern "system" fn keyboard_hook_proc(code: i32, wparam: WPARAM, lparam: 
                     ctx.current_modifiers &= !modifier;
                 }
 
-                // Only emit event if modifiers actually changed
-                if ctx.current_modifiers != prev_modifiers {
-                    // Check if modifier-only combo should be blocked
-                    should_block =
-                        should_block_hotkey(&ctx.blocking_hotkeys, ctx.current_modifiers, None);
+                // Unchanged modifiers mean an autorepeat (or a release we
+                // already accounted for): nothing to decide and nothing to
+                // emit.
+                let changed = ctx.current_modifiers != prev_modifiers;
 
+                // A press that completes a modifier-only hotkey is blocked,
+                // and so are its autorepeats and its release. A release is
+                // blocked only then: the app must see the release of every
+                // press it saw, or the modifier stays down system-wide.
+                let completes_hotkey = is_key_down
+                    && changed
+                    && should_block_hotkey(&ctx.blocking_hotkeys, ctx.current_modifiers, None);
+                should_block = swallow_modifier_event(
+                    &mut ctx.swallowed_modifiers,
+                    modifier,
+                    is_key_down,
+                    completes_hotkey,
+                );
+
+                if changed {
                     // A blocked modifier press (the Shift of a Win+Shift
                     // modifier-only hotkey) is as invisible to the shell as
                     // a blocked regular key, so it needs the same mask.
@@ -1070,6 +1103,7 @@ mod tests {
             blocking_hotkeys: None,
             altgr_phantom_ctrl: false,
             menu_mask_sent: true,
+            swallowed_modifiers: Modifiers::empty(),
         };
         reconcile_modifiers(&mut ctx);
         assert_eq!(ctx.current_modifiers, Modifiers::empty());
@@ -1077,6 +1111,74 @@ mod tests {
         // The stale CMD_LEFT was cleared via a synthetic release event.
         let release = rx.try_recv().expect("expected a synthetic release");
         assert_eq!(release.changed_modifier, Some(Modifiers::CMD_LEFT));
+        assert!(!release.is_key_down);
+    }
+
+    #[test]
+    fn reconcile_keeps_a_swallowed_modifier_held() {
+        // cjpais/Handy#2398: the Alt of a blocked Ctrl+Alt hotkey never
+        // reached the async key state, so GetAsyncKeyState reports it up
+        // while it is held (as it does here, with no key held during
+        // tests). A mouse click or key press must not read that as a
+        // missed release.
+        let (tx, rx) = mpsc::channel();
+        let mut ctx = HookContext {
+            event_sender: tx,
+            current_modifiers: Modifiers::OPT_LEFT,
+            blocking_hotkeys: None,
+            altgr_phantom_ctrl: false,
+            menu_mask_sent: false,
+            swallowed_modifiers: Modifiers::OPT_LEFT,
+        };
+        reconcile_modifiers(&mut ctx);
+        assert_eq!(ctx.current_modifiers, Modifiers::OPT_LEFT);
+        assert_eq!(ctx.swallowed_modifiers, Modifiers::OPT_LEFT);
+        assert!(rx.try_recv().is_err(), "no synthetic release expected");
+    }
+
+    #[test]
+    fn reconcile_still_releases_a_stale_modifier_beside_a_swallowed_one() {
+        // Ctrl passed through and its release was missed; Alt is swallowed
+        // and still held. Only Ctrl is stale.
+        let (tx, rx) = mpsc::channel();
+        let mut ctx = HookContext {
+            event_sender: tx,
+            current_modifiers: Modifiers::CTRL_LEFT | Modifiers::OPT_LEFT,
+            blocking_hotkeys: None,
+            altgr_phantom_ctrl: false,
+            menu_mask_sent: false,
+            swallowed_modifiers: Modifiers::OPT_LEFT,
+        };
+        reconcile_modifiers(&mut ctx);
+        assert_eq!(ctx.current_modifiers, Modifiers::OPT_LEFT);
+        let release = rx.try_recv().expect("expected a synthetic release");
+        assert_eq!(release.changed_modifier, Some(Modifiers::CTRL_LEFT));
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn session_reconcile_releases_a_swallowed_modifier() {
+        // Lock, unlock, resume: the release of a swallowed modifier may
+        // have been lost with the desktop, so it must not stay held.
+        let (tx, rx) = mpsc::channel();
+        HOOK_CONTEXT.with(|cell| {
+            *cell.borrow_mut() = Some(HookContext {
+                event_sender: tx,
+                current_modifiers: Modifiers::OPT_LEFT,
+                blocking_hotkeys: None,
+                altgr_phantom_ctrl: false,
+                menu_mask_sent: false,
+                swallowed_modifiers: Modifiers::OPT_LEFT,
+            });
+        });
+        reconcile_modifiers_in_context();
+        let ctx = HOOK_CONTEXT
+            .with(|cell| cell.borrow_mut().take())
+            .expect("context set above");
+        assert_eq!(ctx.current_modifiers, Modifiers::empty());
+        assert_eq!(ctx.swallowed_modifiers, Modifiers::empty());
+        let release = rx.try_recv().expect("expected a synthetic release");
+        assert_eq!(release.changed_modifier, Some(Modifiers::OPT_LEFT));
         assert!(!release.is_key_down);
     }
 
