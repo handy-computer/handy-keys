@@ -147,6 +147,13 @@ fn reconcile_modifiers(current: &mut Modifiers, flags: CGEventFlags) {
     }
 }
 
+/// Whether an event was posted by this process (e.g. text typed or pasted
+/// with enigo by the app that owns this listener).
+fn posted_by_this_process(event: &CGEvent) -> bool {
+    CGEvent::integer_value_field(Some(event), CGEventField::EventSourceUnixProcessID)
+        == i64::from(std::process::id())
+}
+
 /// Context handed to the event tap callback through the refcon pointer.
 ///
 /// `tap` is filled in right after `CGEventTapCreate` returns. The callback and
@@ -202,15 +209,24 @@ unsafe extern "C-unwind" fn event_tap_callback(
         // Reconcile tracked modifiers against OS flags for non-FlagsChanged events.
         // On FlagsChanged, flags reflect the state *after* the current change, so
         // reconciling would fight with the toggle logic.
+        let mut event_modifiers = state.current_modifiers;
         if event_type != CGEventType::FlagsChanged {
-            reconcile_modifiers(&mut state.current_modifiers, flags);
+            reconcile_modifiers(&mut event_modifiers, flags);
+
+            // Our own posted events (e.g. enigo typing with flags forced to
+            // zero) don't reflect what the user is holding; storing them would
+            // invert the FlagsChanged toggle below. Still report them with
+            // their own flags.
+            if !posted_by_this_process(cg_event) {
+                state.current_modifiers = event_modifiers;
+            }
         }
 
         // Build side-specific modifiers from internally tracked state + FN from flags
         let modifiers = if flags_have_fn(flags) {
-            state.current_modifiers | Modifiers::FN
+            event_modifiers | Modifiers::FN
         } else {
-            state.current_modifiers & !Modifiers::FN
+            event_modifiers & !Modifiers::FN
         };
 
         match event_type {
@@ -749,6 +765,120 @@ mod tests {
             ctx.state.lock().unwrap().current_modifiers,
             Modifiers::empty(),
             "stale modifiers must be reconciled away on tap-disable"
+        );
+    }
+
+    const KC_A: u16 = 0x00;
+    const KC_RIGHT_CTRL: u16 = 0x3E;
+    const FLAG_CONTROL: u64 = CGEventFlags::MaskControl.0;
+    const FLAG_COMMAND: u64 = CGEventFlags::MaskCommand.0;
+    const HARDWARE: i64 = 0;
+
+    fn own() -> i64 {
+        i64::from(std::process::id())
+    }
+
+    fn make_ctx_with_events() -> (CallbackCtx, Receiver<KeyEvent>) {
+        let (tx, rx) = mpsc::channel();
+        let ctx = CallbackCtx {
+            state: Arc::new(Mutex::new(ListenerState::new(tx, None))),
+            tap: Cell::new(None),
+        };
+        (ctx, rx)
+    }
+
+    /// Run one keyboard event through the tap callback and return what it
+    /// emitted. The event is never posted, so no accessibility permission is
+    /// needed.
+    fn deliver(
+        ctx: &CallbackCtx,
+        rx: &Receiver<KeyEvent>,
+        event_type: CGEventType,
+        keycode: u16,
+        flags: u64,
+        source_pid: i64,
+    ) -> Vec<KeyEvent> {
+        let event = CGEvent::new_keyboard_event(None, keycode, true).expect("create CGEvent");
+        CGEvent::set_type(Some(&event), event_type);
+        CGEvent::set_flags(Some(&event), CGEventFlags(flags));
+        CGEvent::set_integer_value_field(
+            Some(&event),
+            CGEventField::EventSourceUnixProcessID,
+            source_pid,
+        );
+        unsafe {
+            event_tap_callback(
+                std::ptr::null_mut(),
+                event_type,
+                NonNull::from(&*event),
+                ctx as *const CallbackCtx as *mut c_void,
+            );
+        }
+        rx.try_iter().collect()
+    }
+
+    /// Text we type with enigo (flags forced to zero) while the user holds a
+    /// modifier-only hotkey must not clear that modifier, or the release is
+    /// reported as a press (cjpais/Handy#2501).
+    #[test]
+    fn own_posted_key_event_does_not_clear_a_held_modifier() {
+        let (ctx, rx) = make_ctx_with_events();
+        let flags_changed = CGEventType::FlagsChanged;
+
+        let down = deliver(
+            &ctx,
+            &rx,
+            flags_changed,
+            KC_RIGHT_CTRL,
+            FLAG_CONTROL,
+            HARDWARE,
+        );
+        assert!(down[0].is_key_down);
+
+        deliver(&ctx, &rx, CGEventType::KeyDown, KC_A, 0, own());
+        assert_eq!(
+            ctx.state.lock().unwrap().current_modifiers,
+            Modifiers::CTRL_RIGHT
+        );
+
+        let up = deliver(&ctx, &rx, flags_changed, KC_RIGHT_CTRL, 0, HARDWARE);
+        assert_eq!(up.len(), 1);
+        assert!(!up[0].is_key_down);
+        assert_eq!(up[0].modifiers, Modifiers::empty());
+    }
+
+    /// Our own posted events are still reported with their own flags.
+    #[test]
+    fn own_posted_key_event_reports_modifiers_from_its_own_flags() {
+        let (ctx, rx) = make_ctx_with_events();
+        deliver(
+            &ctx,
+            &rx,
+            CGEventType::FlagsChanged,
+            KC_RIGHT_CTRL,
+            FLAG_CONTROL,
+            HARDWARE,
+        );
+
+        let plain = deliver(&ctx, &rx, CGEventType::KeyDown, KC_A, 0, own());
+        assert_eq!(plain[0].modifiers, Modifiers::empty());
+
+        let with_cmd = deliver(&ctx, &rx, CGEventType::KeyDown, KC_A, FLAG_COMMAND, own());
+        assert_eq!(with_cmd[0].modifiers, Modifiers::CMD_LEFT);
+    }
+
+    /// Events from any other source still reconcile tracked state: a stale
+    /// modifier is cleared and a missed press is filled in.
+    #[test]
+    fn other_key_events_still_reconcile_modifiers() {
+        let (ctx, rx) = make_ctx_with_events();
+        let other = own() + 1;
+        ctx.state.lock().unwrap().current_modifiers = Modifiers::SHIFT_LEFT;
+
+        deliver(&ctx, &rx, CGEventType::KeyDown, KC_A, FLAG_CONTROL, other);
+        assert_eq!(
+            ctx.state.lock().unwrap().current_modifiers,
+            Modifiers::CTRL_LEFT
         );
     }
 }
