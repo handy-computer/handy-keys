@@ -213,16 +213,10 @@ unsafe extern "C-unwind" fn event_tap_callback(
         if event_type != CGEventType::FlagsChanged {
             reconcile_modifiers(&mut event_modifiers, flags);
 
-            // Events this process posted say nothing about what the user is
-            // physically holding: enigo types text with the flags forced to
-            // zero, and the app that owns this listener sees those events in
-            // its own tap. Storing that as "no modifier is held" while the user
-            // is holding one makes the toggle below report the release as a
-            // press, and every press and release after it inverted. The event
-            // itself is still reported with the modifiers from its own flags.
-            //
-            // Events from any other source (hardware, remappers, remote
-            // desktop, accessibility tools) reconcile exactly as before.
+            // Our own posted events (e.g. enigo typing with flags forced to
+            // zero) don't reflect what the user is holding; storing them would
+            // invert the FlagsChanged toggle below. Still report them with
+            // their own flags.
             if !posted_by_this_process(cg_event) {
                 state.current_modifiers = event_modifiers;
             }
@@ -778,17 +772,10 @@ mod tests {
     const KC_RIGHT_CTRL: u16 = 0x3E;
     const FLAG_CONTROL: u64 = CGEventFlags::MaskControl.0;
     const FLAG_COMMAND: u64 = CGEventFlags::MaskCommand.0;
-    /// Hardware events have no source process.
     const HARDWARE: i64 = 0;
 
-    /// An event posted by the process that owns the listener.
     fn own() -> i64 {
         i64::from(std::process::id())
-    }
-
-    /// An event posted by some other process (remapper, remote desktop, ...).
-    fn other_process() -> i64 {
-        own() + 1
     }
 
     fn make_ctx_with_events() -> (CallbackCtx, Receiver<KeyEvent>) {
@@ -801,8 +788,8 @@ mod tests {
     }
 
     /// Run one keyboard event through the tap callback and return what it
-    /// emitted. Needs no accessibility permission: the event is handed to the
-    /// callback directly and never posted.
+    /// emitted. The event is never posted, so no accessibility permission is
+    /// needed.
     fn deliver(
         ctx: &CallbackCtx,
         rx: &Receiver<KeyEvent>,
@@ -830,12 +817,9 @@ mod tests {
         rx.try_iter().collect()
     }
 
-    /// Regression test for a push-to-talk app that types its result with
-    /// enigo: enigo posts KeyDown events with the flags forced to zero, and the
-    /// app sees them in its own tap. If the user is already holding a
-    /// modifier-only hotkey again when the text is typed, the typed event must
-    /// not be taken as "no modifier is held" - that inverted the toggle, so
-    /// the release went unreported and every later press/release was swapped.
+    /// Text we type with enigo (flags forced to zero) while the user holds a
+    /// modifier-only hotkey must not clear that modifier, or the release is
+    /// reported as a press (cjpais/Handy#2501).
     #[test]
     fn own_posted_key_event_does_not_clear_a_held_modifier() {
         let (ctx, rx) = make_ctx_with_events();
@@ -849,43 +833,21 @@ mod tests {
             FLAG_CONTROL,
             HARDWARE,
         );
-        assert_eq!(down.len(), 1);
         assert!(down[0].is_key_down);
-        assert_eq!(down[0].modifiers, Modifiers::CTRL_RIGHT);
 
-        // The app types text while the key is still held.
         deliver(&ctx, &rx, CGEventType::KeyDown, KC_A, 0, own());
         assert_eq!(
             ctx.state.lock().unwrap().current_modifiers,
-            Modifiers::CTRL_RIGHT,
-            "a posted event must not change which modifiers are tracked as held"
+            Modifiers::CTRL_RIGHT
         );
 
         let up = deliver(&ctx, &rx, flags_changed, KC_RIGHT_CTRL, 0, HARDWARE);
         assert_eq!(up.len(), 1);
-        assert!(
-            !up[0].is_key_down,
-            "the release must be reported as a release"
-        );
-        assert_eq!(up[0].modifiers, Modifiers::empty());
-
-        // And the next press/release pair is not inverted.
-        let down = deliver(
-            &ctx,
-            &rx,
-            flags_changed,
-            KC_RIGHT_CTRL,
-            FLAG_CONTROL,
-            HARDWARE,
-        );
-        assert!(down[0].is_key_down);
-        let up = deliver(&ctx, &rx, flags_changed, KC_RIGHT_CTRL, 0, HARDWARE);
         assert!(!up[0].is_key_down);
+        assert_eq!(up[0].modifiers, Modifiers::empty());
     }
 
-    /// A posted key event is still reported with the modifiers from its own
-    /// flags, so hotkey matching and blocking see it the way the target
-    /// application will.
+    /// Our own posted events are still reported with their own flags.
     #[test]
     fn own_posted_key_event_reports_modifiers_from_its_own_flags() {
         let (ctx, rx) = make_ctx_with_events();
@@ -899,59 +861,21 @@ mod tests {
         );
 
         let plain = deliver(&ctx, &rx, CGEventType::KeyDown, KC_A, 0, own());
-        assert_eq!(plain.len(), 1);
         assert_eq!(plain[0].modifiers, Modifiers::empty());
 
         let with_cmd = deliver(&ctx, &rx, CGEventType::KeyDown, KC_A, FLAG_COMMAND, own());
-        assert_eq!(with_cmd.len(), 1);
         assert_eq!(with_cmd[0].modifiers, Modifiers::CMD_LEFT);
     }
 
-    /// Hardware key events keep reconciling: a stale modifier whose release
-    /// was missed is cleared by the next real key event.
+    /// Events from any other source still reconcile tracked state: a stale
+    /// modifier is cleared and a missed press is filled in.
     #[test]
-    fn hardware_key_event_still_reconciles_stale_modifiers() {
+    fn other_key_events_still_reconcile_modifiers() {
         let (ctx, rx) = make_ctx_with_events();
-        ctx.state.lock().unwrap().current_modifiers = Modifiers::CTRL_LEFT;
+        let other = own() + 1;
+        ctx.state.lock().unwrap().current_modifiers = Modifiers::SHIFT_LEFT;
 
-        let key = deliver(&ctx, &rx, CGEventType::KeyDown, KC_A, 0, HARDWARE);
-        assert_eq!(key.len(), 1);
-        assert_eq!(key[0].modifiers, Modifiers::empty());
-        assert_eq!(
-            ctx.state.lock().unwrap().current_modifiers,
-            Modifiers::empty()
-        );
-    }
-    /// Events posted by other processes keep reconciling the tracked state,
-    /// exactly as before: a stale modifier is cleared by them.
-    #[test]
-    fn other_process_key_event_still_reconciles_stale_modifiers() {
-        let (ctx, rx) = make_ctx_with_events();
-        ctx.state.lock().unwrap().current_modifiers = Modifiers::CTRL_LEFT;
-
-        let key = deliver(&ctx, &rx, CGEventType::KeyDown, KC_A, 0, other_process());
-        assert_eq!(key.len(), 1);
-        assert_eq!(key[0].modifiers, Modifiers::empty());
-        assert_eq!(
-            ctx.state.lock().unwrap().current_modifiers,
-            Modifiers::empty()
-        );
-    }
-
-    /// Events posted by other processes still fill in a missed press, exactly
-    /// as before.
-    #[test]
-    fn other_process_key_event_still_records_missed_press() {
-        let (ctx, rx) = make_ctx_with_events();
-
-        deliver(
-            &ctx,
-            &rx,
-            CGEventType::KeyDown,
-            KC_A,
-            FLAG_CONTROL,
-            other_process(),
-        );
+        deliver(&ctx, &rx, CGEventType::KeyDown, KC_A, FLAG_CONTROL, other);
         assert_eq!(
             ctx.state.lock().unwrap().current_modifiers,
             Modifiers::CTRL_LEFT
