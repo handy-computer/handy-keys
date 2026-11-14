@@ -159,9 +159,13 @@ enum PressPhase {
     Up,
 }
 
-/// Blocking decisions per key press: the initial key-down decides, and that
-/// press's autorepeats and key-up get the same answer, whatever the modifiers
-/// are by then. Mirrors the Linux backend's `blocked_keys`.
+/// Blocking decisions per key press. A key-down blocked as a hotkey keeps its
+/// autorepeats and key-up blocked, whatever the modifiers are by then. A
+/// key-up always follows its key-down's decision.
+///
+/// The repeats of a press whose key-down passed are still judged on their own
+/// modifiers: pressing Space just before Opt and holding fires Opt+Space from
+/// the repeats, and those repeats must not also type into the app.
 ///
 /// Judging every event on its own modifiers splits a press between us and the
 /// focused app as soon as the modifiers change mid-press: releasing Cmd before
@@ -190,11 +194,11 @@ impl PressBlocking {
                 self.decided.insert(keycode, matches_hotkey);
                 matches_hotkey
             }
-            PressPhase::Repeat => self
-                .decided
-                .get(&keycode)
-                .copied()
-                .unwrap_or(matches_hotkey),
+            // A blocked press stays blocked. The repeats of a press that
+            // passed (or that we never saw) are judged on their own, as
+            // before: the manager fires the hotkey on a matching repeat, so
+            // letting it through would reach the app as well.
+            PressPhase::Repeat => self.decided.get(&keycode) == Some(&true) || matches_hotkey,
             PressPhase::Up => self.decided.remove(&keycode).unwrap_or(matches_hotkey),
         }
     }
@@ -917,9 +921,10 @@ mod tests {
         assert!(p.decide(1, Down, true));
         assert!(p.decide(1, Repeat, false));
         assert!(p.decide(1, Up, false));
-        // Passed press: repeats and key-up follow it.
+        // Passed press: repeats are judged on their own; key-up follows it.
         assert!(!p.decide(1, Down, false));
-        assert!(!p.decide(1, Repeat, true));
+        assert!(!p.decide(1, Repeat, false));
+        assert!(p.decide(1, Repeat, true));
         assert!(!p.decide(1, Up, true));
         // No recorded press: judged on its own, as before.
         assert!(p.decide(2, Repeat, true));
@@ -934,7 +939,7 @@ mod tests {
         assert!(p.decide(4, Down, true));
         assert!(!p.decide(5, Down, false));
         assert!(p.decide(4, Repeat, false));
-        assert!(!p.decide(5, Repeat, true));
+        assert!(!p.decide(5, Repeat, false));
         // forget_all drops everything.
         p.forget_all();
         assert!(p.decided.is_empty());
@@ -971,14 +976,27 @@ mod tests {
         assert!(send_key(&ctx, VK_SPACE, Up, CGEventFlags::empty()));
     }
 
-    /// A press that reached the app keeps reaching it: blocking its key-up
-    /// would leave the key stuck down there.
+    /// Space pressed just before Opt, then held: the repeats match the hotkey
+    /// (the manager fires on them) and are blocked, but the key-up passes,
+    /// since the app saw the key-down and would otherwise keep the key down.
     #[test]
-    fn passed_press_is_never_blocked_later() {
-        let (ctx, _rx, _set) = blocking_ctx(&["Cmd+Space"]);
+    fn key_before_modifier_blocks_matching_repeats_but_not_key_up() {
+        let (ctx, _rx, _set) = blocking_ctx(&["Opt+Space"]);
         assert!(!send_key(&ctx, VK_SPACE, Down, CGEventFlags::empty()));
-        assert!(!send_key(&ctx, VK_SPACE, Repeat, CGEventFlags::MaskCommand));
-        assert!(!send_key(&ctx, VK_SPACE, Up, CGEventFlags::MaskCommand));
+        assert!(!send_key(&ctx, VK_SPACE, Repeat, CGEventFlags::empty()));
+        assert!(send_key(
+            &ctx,
+            VK_SPACE,
+            Repeat,
+            CGEventFlags::MaskAlternate
+        ));
+        assert!(send_key(
+            &ctx,
+            VK_SPACE,
+            Repeat,
+            CGEventFlags::MaskAlternate
+        ));
+        assert!(!send_key(&ctx, VK_SPACE, Up, CGEventFlags::MaskAlternate));
     }
 
     /// The ordinary case is unchanged.
