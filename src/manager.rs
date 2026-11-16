@@ -96,6 +96,8 @@ pub struct HotkeyManager {
     running: Arc<std::sync::atomic::AtomicBool>,
     /// Shared set of hotkeys to block
     blocking_hotkeys: Option<BlockingHotkeys>,
+    /// The listener's flag for "stopped because accessibility was revoked"
+    accessibility_revoked: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl HotkeyManager {
@@ -105,6 +107,7 @@ impl HotkeyManager {
     pub fn new() -> Result<Self> {
         let listener = KeyboardListener::new()?;
 
+        let accessibility_revoked = listener.accessibility_revoked_flag();
         let (tx, rx) = mpsc::channel();
         let state = Arc::new(Mutex::new(ManagerState::new()));
         let running = Arc::new(std::sync::atomic::AtomicBool::new(true));
@@ -122,6 +125,7 @@ impl HotkeyManager {
             _thread_handle: Some(handle),
             running,
             blocking_hotkeys: None,
+            accessibility_revoked,
         })
     }
 
@@ -136,6 +140,7 @@ impl HotkeyManager {
         let blocking_hotkeys: BlockingHotkeys = Arc::new(Mutex::new(HashSet::new()));
         let listener = KeyboardListener::new_with_blocking(blocking_hotkeys.clone())?;
 
+        let accessibility_revoked = listener.accessibility_revoked_flag();
         let (tx, rx) = mpsc::channel();
         let state = Arc::new(Mutex::new(ManagerState::new()));
         let running = Arc::new(std::sync::atomic::AtomicBool::new(true));
@@ -153,6 +158,7 @@ impl HotkeyManager {
             _thread_handle: Some(handle),
             running,
             blocking_hotkeys: Some(blocking_hotkeys),
+            accessibility_revoked,
         })
     }
 
@@ -183,7 +189,7 @@ impl HotkeyManager {
                     // No event received, loop continues to check running flag
                 }
                 Err(_) => {
-                    // Listener disconnected, exit
+                    // Listener stopped (status() reports why), exit
                     return;
                 }
             }
@@ -251,18 +257,39 @@ impl HotkeyManager {
         state.hotkeys.get(&id).copied()
     }
 
+    /// Whether the manager still receives keyboard events.
+    ///
+    /// `Ok(())` while it runs. Once its listener stopped on its own, the
+    /// reason: [`Error::AccessibilityRevoked`] when the macOS accessibility
+    /// permission was revoked, [`Error::EventLoopNotRunning`] otherwise. A
+    /// stopped manager never recovers; create a new one.
+    pub fn status(&self) -> Result<()> {
+        if self
+            .accessibility_revoked
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(Error::AccessibilityRevoked);
+        }
+        match &self._thread_handle {
+            Some(handle) if handle.is_finished() => Err(Error::EventLoopNotRunning),
+            _ => Ok(()),
+        }
+    }
+
     /// Blocking receive for hotkey events
     ///
-    /// Blocks until a hotkey event is received or the event loop stops.
+    /// Blocks until a hotkey event is received or the event loop stops. Once
+    /// it stopped, returns why (see [`status`](Self::status)).
     pub fn recv(&self) -> Result<HotkeyEvent> {
         self.event_receiver
             .recv()
-            .map_err(|_| Error::EventLoopNotRunning)
+            .map_err(|_| crate::listener::stopped_error(&self.accessibility_revoked))
     }
 
     /// Non-blocking receive for hotkey events
     ///
-    /// Returns `Some(event)` if an event is available, `None` otherwise.
+    /// Returns `Some(event)` if an event is available, `None` otherwise
+    /// (including once the manager stopped; see [`status`](Self::status)).
     pub fn try_recv(&self) -> Option<HotkeyEvent> {
         match self.event_receiver.try_recv() {
             Ok(event) => Some(event),

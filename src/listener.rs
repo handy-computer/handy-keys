@@ -37,6 +37,9 @@ pub struct KeyboardListener {
     /// macOS parks its listener thread in a CFRunLoop with no periodic
     /// wakeups (see run_event_tap), so Drop must stop that loop explicitly.
     stop_wakeup: Option<Box<dyn Fn() + Send>>,
+    /// Set by the backend when it stopped because the accessibility
+    /// permission was revoked (macOS only).
+    accessibility_revoked: Arc<AtomicBool>,
 }
 
 impl KeyboardListener {
@@ -76,6 +79,7 @@ impl KeyboardListener {
                 running: state.running,
                 blocking_hotkeys: state.blocking_hotkeys,
                 stop_wakeup: Some(Box::new(move || run_loop.stop())),
+                accessibility_revoked: state.accessibility_revoked,
             })
         }
 
@@ -89,6 +93,7 @@ impl KeyboardListener {
                 running: state.running,
                 blocking_hotkeys: state.blocking_hotkeys,
                 stop_wakeup: None,
+                accessibility_revoked: Arc::new(AtomicBool::new(false)),
             })
         }
 
@@ -102,6 +107,7 @@ impl KeyboardListener {
                 running: state.running,
                 blocking_hotkeys: state.blocking_hotkeys,
                 stop_wakeup: None,
+                accessibility_revoked: Arc::new(AtomicBool::new(false)),
             })
         }
     }
@@ -111,13 +117,37 @@ impl KeyboardListener {
         self.blocking_hotkeys.as_ref()
     }
 
+    /// Whether the listener is still running.
+    ///
+    /// `Ok(())` while it runs. Once it stopped on its own, the reason:
+    /// [`Error::AccessibilityRevoked`] when the macOS accessibility permission
+    /// was revoked, [`Error::EventLoopNotRunning`] otherwise. A stopped
+    /// listener never recovers; create a new one.
+    pub fn status(&self) -> Result<()> {
+        if self.accessibility_revoked.load(Ordering::SeqCst) {
+            return Err(Error::AccessibilityRevoked);
+        }
+        match &self._thread_handle {
+            Some(handle) if handle.is_finished() => Err(Error::EventLoopNotRunning),
+            _ => Ok(()),
+        }
+    }
+
+    pub(crate) fn accessibility_revoked_flag(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.accessibility_revoked)
+    }
+
+    /// The error for a disconnected event channel: why the listener stopped.
+    fn stopped_error(&self) -> Error {
+        stopped_error(&self.accessibility_revoked)
+    }
+
     /// Blocking receive for key events
     ///
-    /// Blocks until a key event is received or the listener stops.
+    /// Blocks until a key event is received or the listener stops. Once it
+    /// stopped, returns why (see [`status`](Self::status)).
     pub fn recv(&self) -> Result<KeyEvent> {
-        self.event_receiver
-            .recv()
-            .map_err(|_| Error::EventLoopNotRunning)
+        self.event_receiver.recv().map_err(|_| self.stopped_error())
     }
 
     /// Blocking receive with timeout
@@ -128,19 +158,29 @@ impl KeyboardListener {
             .recv_timeout(timeout)
             .map_err(|e| match e {
                 std::sync::mpsc::RecvTimeoutError::Timeout => Error::Timeout,
-                std::sync::mpsc::RecvTimeoutError::Disconnected => Error::EventLoopNotRunning,
+                std::sync::mpsc::RecvTimeoutError::Disconnected => self.stopped_error(),
             })
     }
 
     /// Non-blocking receive for key events
     ///
-    /// Returns `Some(event)` if an event is available, `None` otherwise.
+    /// Returns `Some(event)` if an event is available, `None` otherwise
+    /// (including once the listener stopped; see [`status`](Self::status)).
     pub fn try_recv(&self) -> Option<KeyEvent> {
         match self.event_receiver.try_recv() {
             Ok(event) => Some(event),
             Err(TryRecvError::Empty) => None,
             Err(TryRecvError::Disconnected) => None,
         }
+    }
+}
+
+/// Why a listener whose event channel disconnected stopped.
+pub(crate) fn stopped_error(accessibility_revoked: &AtomicBool) -> Error {
+    if accessibility_revoked.load(Ordering::SeqCst) {
+        Error::AccessibilityRevoked
+    } else {
+        Error::EventLoopNotRunning
     }
 }
 
