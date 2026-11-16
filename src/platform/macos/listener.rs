@@ -86,7 +86,7 @@ pub(crate) fn spawn(blocking_hotkeys: Option<BlockingHotkeys>) -> Result<MacOSLi
     let thread_running = Arc::clone(&running);
 
     let handle = thread::spawn(move || {
-        run_event_tap(thread_state, thread_running, init_tx);
+        run_event_tap(thread_state, thread_running, may_run_active_tap, init_tx);
     });
 
     // Wait for the event tap to be created
@@ -226,6 +226,161 @@ struct CallbackCtx {
     state: Arc<Mutex<ListenerState>>,
     tap: Cell<Option<NonNull<CFMachPort>>>,
     presses: RefCell<PressBlocking>,
+    /// We switched the tap off because the accessibility permission is gone.
+    paused: Cell<bool>,
+    /// The permission check (`may_run_active_tap`); replaced in tests.
+    is_trusted: fn() -> bool,
+}
+
+impl CallbackCtx {
+    fn new(state: Arc<Mutex<ListenerState>>, is_trusted: fn() -> bool) -> Self {
+        CallbackCtx {
+            state,
+            tap: Cell::new(None),
+            presses: RefCell::new(PressBlocking::default()),
+            paused: Cell::new(false),
+            is_trusted,
+        }
+    }
+
+    /// Keep the tap on only while we have the accessibility permission.
+    ///
+    /// Once the permission is revoked, an enabled tap gets no events, but
+    /// every keyboard and mouse event of the session still waits on it: the
+    /// whole Mac stops responding (cjpais/Handy#1281). A disabled tap is out
+    /// of the input path, and goes back on when the permission returns.
+    fn check_access(&self) {
+        let trusted = (self.is_trusted)();
+        if !trusted && self.paused.get() {
+            // Already off. Our own disable comes back as a
+            // TapDisabledByUserInput pseudo-event, which lands here again.
+            return;
+        }
+        if let Some(tap) = self.tap.get() {
+            // Safety: the tap outlives the context (see run_event_tap).
+            CGEvent::tap_enable(unsafe { tap.as_ref() }, trusted);
+        }
+        if self.paused.replace(!trusted) {
+            self.resync_after_gap();
+        }
+    }
+
+    /// The tap was off for a while, so events were missed.
+    fn resync_after_gap(&self) {
+        // Forget per-press decisions so they cannot apply to a later,
+        // unrelated press.
+        self.presses.borrow_mut().forget_all();
+        if let Ok(mut state) = self.state.lock() {
+            reconcile_modifiers(
+                &mut state.current_modifiers,
+                CGEventSource::flags_state(CGEventSourceStateID::CombinedSessionState),
+            );
+        }
+    }
+}
+
+/// tccd posts this Darwin notification after a privacy permission changed.
+/// It arrives through libdispatch, so it needs no main-thread run loop.
+const TCC_ACCESS_CHANGED: &std::ffi::CStr = c"com.apple.tcc.access.changed";
+
+/// Every change is checked a second time this much later, in case
+/// WindowServer had not picked it up yet.
+const ACCESS_RECHECK_DELAY_NANOS: i64 = 500_000_000;
+
+extern "C" {
+    fn notify_register_dispatch(
+        name: *const std::ffi::c_char,
+        out_token: *mut i32,
+        queue: *mut c_void,
+        handler: &block2::DynBlock<dyn Fn(i32)>,
+    ) -> u32;
+    fn notify_cancel(token: i32) -> u32;
+    fn dispatch_get_global_queue(identifier: isize, flags: usize) -> *mut c_void;
+    fn dispatch_time(when: u64, delta: i64) -> u64;
+    fn dispatch_after(when: u64, queue: *mut c_void, block: &block2::DynBlock<dyn Fn()>);
+}
+
+thread_local! {
+    /// The CallbackCtx of the tap running on this thread.
+    static TAP_CTX: Cell<*const CallbackCtx> = const { Cell::new(std::ptr::null()) };
+}
+
+impl TapRunLoop {
+    /// Run `CallbackCtx::check_access` on the tap thread. Callable from any
+    /// thread; does nothing once the tap thread has left its run loop.
+    fn check_access(&self) {
+        let block = block2::StackBlock::new(|| {
+            let ctx = TAP_CTX.with(Cell::get);
+            if !ctx.is_null() {
+                // Safety: run_event_tap clears TAP_CTX before freeing it.
+                unsafe { &*ctx }.check_access();
+            }
+        });
+        unsafe {
+            self.0.perform_block(
+                objc2_core_foundation::kCFRunLoopCommonModes.map(|m| m.as_ref()),
+                Some(&block),
+            );
+        }
+        self.0.wake_up();
+    }
+
+    /// The permission may have changed: check now and once more shortly.
+    fn on_access_changed(&self) {
+        self.check_access();
+        let run_loop = TapRunLoop(self.0.clone());
+        let recheck = block2::RcBlock::new(move || run_loop.check_access());
+        unsafe {
+            dispatch_after(
+                dispatch_time(0, ACCESS_RECHECK_DELAY_NANOS),
+                dispatch_get_global_queue(0, 0),
+                &recheck,
+            );
+        }
+    }
+}
+
+/// Call `on_access_changed` for this tap thread on every permission change.
+/// Returns the token for `notify_cancel`.
+fn observe_access_changes(run_loop: &CFRetained<CFRunLoop>) -> Option<i32> {
+    let run_loop = TapRunLoop(run_loop.clone());
+    let handler = block2::RcBlock::new(move |_token: i32| run_loop.on_access_changed());
+    let mut token = 0;
+    let status = unsafe {
+        notify_register_dispatch(
+            TCC_ACCESS_CHANGED.as_ptr(),
+            &mut token,
+            dispatch_get_global_queue(0, 0),
+            &handler,
+        )
+    };
+    (status == 0).then_some(token)
+}
+
+/// Whether we have the accessibility permission, asked fresh: creating an
+/// active tap makes WindowServer check it. AXIsProcessTrusted() answers from
+/// a per-process cache that can keep saying "trusted" after a revoke. The
+/// probe tap matches no real event type and is destroyed at once.
+fn may_run_active_tap() -> bool {
+    unsafe extern "C-unwind" fn pass(
+        _proxy: CGEventTapProxy,
+        _event_type: CGEventType,
+        event: NonNull<CGEvent>,
+        _user_info: *mut c_void,
+    ) -> *mut CGEvent {
+        event.as_ptr()
+    }
+    let tap = unsafe {
+        CGEvent::tap_create(
+            CGEventTapLocation::SessionEventTap,
+            CGEventTapPlacement::TailAppendEventTap,
+            CGEventTapOptions::Default,
+            1 << CGEventType::Null.0,
+            Some(pass),
+            std::ptr::null_mut(),
+        )
+    };
+    tap.inspect(|tap| CFMachPort::invalidate(tap)).is_some()
 }
 
 /// The callback function for the event tap
@@ -251,19 +406,9 @@ unsafe extern "C-unwind" fn event_tap_callback(
         event_type,
         CGEventType::TapDisabledByTimeout | CGEventType::TapDisabledByUserInput
     ) {
-        if let Some(tap) = ctx.tap.get() {
-            CGEvent::tap_enable(tap.as_ref(), true);
-        }
-        // Key events may have been missed while disabled; forget per-press
-        // decisions so they cannot apply to a later, unrelated press.
-        ctx.presses.borrow_mut().forget_all();
-        // Reconcile modifiers: we may have missed events while disabled.
-        if let Ok(mut state) = ctx.state.lock() {
-            reconcile_modifiers(
-                &mut state.current_modifiers,
-                CGEventSource::flags_state(CGEventSourceStateID::CombinedSessionState),
-            );
-        }
+        // Re-enables only while we still have the accessibility permission.
+        ctx.check_access();
+        ctx.resync_after_gap();
         return event.as_ptr();
     }
 
@@ -538,6 +683,7 @@ unsafe extern "C-unwind" fn event_tap_callback(
 fn run_event_tap(
     state: Arc<Mutex<ListenerState>>,
     running: Arc<AtomicBool>,
+    is_trusted: fn() -> bool,
     init_tx: Sender<std::result::Result<TapRunLoop, String>>,
 ) {
     // Event types we want to monitor
@@ -553,11 +699,7 @@ fn run_event_tap(
         | (1 << CGEventType::OtherMouseUp.0);
 
     // Callback context, handed to the tap as a raw refcon pointer
-    let ctx_ptr = Box::into_raw(Box::new(CallbackCtx {
-        state: Arc::clone(&state),
-        tap: Cell::new(None),
-        presses: RefCell::new(PressBlocking::default()),
-    }));
+    let ctx_ptr = Box::into_raw(Box::new(CallbackCtx::new(Arc::clone(&state), is_trusted)));
 
     let callback: CGEventTapCallBack = Some(event_tap_callback);
 
@@ -627,6 +769,11 @@ fn run_event_tap(
     run_loop.add_source(Some(&source), unsafe {
         objc2_core_foundation::kCFRunLoopCommonModes
     });
+
+    // Follow accessibility permission changes (see CallbackCtx::check_access).
+    TAP_CTX.with(|c| c.set(ctx_ptr));
+    let access_observer = observe_access_changes(&run_loop);
+
     CGEvent::tap_enable(&tap, true);
 
     // Signal successful initialization, handing back this thread's run loop
@@ -640,9 +787,8 @@ fn run_event_tap(
     // and even the bare 100ms cycling cost ~10 mach messages/sec. Tap
     // recovery is event-driven in event_tap_callback; shutdown goes through
     // TapRunLoop::stop. Guarded by `running` in case the loop returns
-    // without a stop request; bail out if the tap's port died (e.g. the
-    // accessibility permission was revoked) so we don't spin on a dead
-    // source.
+    // without a stop request; bail out if the tap's port died so we don't
+    // spin on a dead source.
     while running.load(std::sync::atomic::Ordering::SeqCst) {
         CFRunLoop::run();
 
@@ -652,6 +798,10 @@ fn run_event_tap(
     }
 
     // Cleanup
+    if let Some(token) = access_observer {
+        unsafe { notify_cancel(token) };
+    }
+    TAP_CTX.with(|c| c.set(std::ptr::null()));
     run_loop.remove_source(Some(&source), unsafe {
         objc2_core_foundation::kCFRunLoopCommonModes
     });
@@ -757,12 +907,20 @@ mod tests {
     }
 
     fn make_ctx(tap: &CFRetained<CFMachPort>) -> CallbackCtx {
+        make_ctx_trusting(Some(tap), || true)
+    }
+
+    fn make_ctx_trusting(
+        tap: Option<&CFRetained<CFMachPort>>,
+        is_trusted: fn() -> bool,
+    ) -> CallbackCtx {
         let (tx, _rx) = mpsc::channel();
-        CallbackCtx {
-            state: Arc::new(Mutex::new(ListenerState::new(tx, None))),
-            tap: Cell::new(Some(NonNull::from(&**tap))),
-            presses: RefCell::new(PressBlocking::default()),
-        }
+        let ctx = CallbackCtx::new(
+            Arc::new(Mutex::new(ListenerState::new(tx, None))),
+            is_trusted,
+        );
+        ctx.tap.set(tap.map(|tap| NonNull::from(&**tap)));
+        ctx
     }
 
     fn deliver_tap_disabled(ctx: &CallbackCtx, event_type: CGEventType) {
@@ -853,6 +1011,122 @@ mod tests {
         );
     }
 
+    // ---- Accessibility permission revoked while running (cjpais/Handy#1281) ----
+
+    /// The probe agrees with AXIsProcessTrusted while that one is fresh (at
+    /// startup), with or without the permission.
+    #[test]
+    fn active_tap_probe_matches_the_permission() {
+        assert_eq!(may_run_active_tap(), check_accessibility());
+    }
+
+    #[test]
+    fn access_change_subscription_registers_and_cancels() {
+        let run_loop = CFRunLoop::current().expect("run loop");
+        let token = observe_access_changes(&run_loop).expect("notify registration");
+        assert_eq!(unsafe { notify_cancel(token) }, 0);
+    }
+
+    thread_local! {
+        static FAKE_TRUSTED: Cell<bool> = const { Cell::new(true) };
+    }
+    fn fake_trusted() -> bool {
+        FAKE_TRUSTED.with(Cell::get)
+    }
+
+    /// Revoked: the tap goes off, and a TapDisabledBy* pseudo-event must not
+    /// put it back in front of all input (that froze the Mac). Granted again:
+    /// it comes back, with the modifier state re-read. The tap itself is only
+    /// checked when the test runner has the permission.
+    #[test]
+    fn tap_follows_the_permission() {
+        let tap = create_test_tap();
+        let ctx = make_ctx_trusting(tap.as_ref(), fake_trusted);
+        let assert_tap_enabled = |expected: bool| {
+            assert_eq!(ctx.paused.get(), !expected);
+            if let Some(tap) = &tap {
+                assert_eq!(CGEvent::tap_is_enabled(tap), expected);
+            }
+        };
+
+        FAKE_TRUSTED.with(|t| t.set(false));
+        ctx.check_access();
+        assert_tap_enabled(false);
+        for event_type in [
+            CGEventType::TapDisabledByTimeout,
+            CGEventType::TapDisabledByUserInput,
+        ] {
+            deliver_tap_disabled(&ctx, event_type);
+            assert_tap_enabled(false);
+        }
+
+        ctx.state.lock().unwrap().current_modifiers = Modifiers::CTRL_LEFT;
+        FAKE_TRUSTED.with(|t| t.set(true));
+        ctx.check_access();
+        assert_tap_enabled(true);
+        assert_eq!(
+            ctx.state.lock().unwrap().current_modifiers,
+            Modifiers::empty()
+        );
+    }
+
+    static E2E_TRUSTED: AtomicBool = AtomicBool::new(true);
+    fn e2e_trusted() -> bool {
+        E2E_TRUSTED.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// End to end on the real tap thread, with injected F20 presses: a revoke
+    /// stops the events without stopping the thread, a grant brings them
+    /// back, and a change the first check missed is caught by the second.
+    #[test]
+    #[ignore = "needs accessibility permission, injects key events; run: cargo test --lib -- --ignored"]
+    fn revoke_pauses_and_grant_resumes_the_tap_thread() {
+        let set_trusted = |trusted| E2E_TRUSTED.store(trusted, std::sync::atomic::Ordering::SeqCst);
+        let (tx, rx) = mpsc::channel();
+        let state = Arc::new(Mutex::new(ListenerState::new(tx, None)));
+        let running = Arc::new(AtomicBool::new(true));
+        let (init_tx, init_rx) = mpsc::channel();
+        let thread_running = Arc::clone(&running);
+        let handle =
+            thread::spawn(move || run_event_tap(state, thread_running, e2e_trusted, init_tx));
+        let run_loop = init_rx.recv().unwrap().expect("tap created");
+
+        let f20_arrives = || {
+            thread::sleep(Duration::from_millis(100));
+            let source = CGEventSource::new(CGEventSourceStateID::HIDSystemState);
+            for key_down in [true, false] {
+                let event = CGEvent::new_keyboard_event(source.as_deref(), 0x5A, key_down)
+                    .expect("failed to create keyboard event");
+                CGEvent::post(CGEventTapLocation::HIDEventTap, Some(&event));
+            }
+            thread::sleep(Duration::from_millis(200));
+            // Drain the channel, so the next call only sees its own presses.
+            rx.try_iter().filter(|e| e.key == Some(Key::F20)).count() > 0
+        };
+        assert!(f20_arrives(), "trusted: events arrive");
+
+        set_trusted(false);
+        run_loop.on_access_changed();
+        assert!(!f20_arrives(), "revoked: the tap is off");
+        assert!(!handle.is_finished(), "revoked: the thread keeps running");
+
+        set_trusted(true);
+        run_loop.on_access_changed();
+        assert!(f20_arrives(), "granted again: events are back");
+
+        // The first check still gets the old answer.
+        run_loop.on_access_changed();
+        thread::sleep(Duration::from_millis(100));
+        set_trusted(false);
+        thread::sleep(Duration::from_millis(600));
+        assert!(!f20_arrives(), "the second check caught the revoke");
+
+        set_trusted(true);
+        running.store(false, std::sync::atomic::Ordering::SeqCst);
+        run_loop.stop();
+        handle.join().unwrap();
+    }
+
     // ---- Per-press blocking (cjpais/Handy#2228) ----
     //
     // These drive the real tap callback with synthetic CGEvents, so they need
@@ -878,11 +1152,10 @@ mod tests {
                 .map(|h| h.parse().expect("hotkey parses"))
                 .collect(),
         ));
-        let ctx = CallbackCtx {
-            state: Arc::new(Mutex::new(ListenerState::new(tx, Some(Arc::clone(&set))))),
-            tap: Cell::new(None),
-            presses: RefCell::new(PressBlocking::default()),
-        };
+        let ctx = CallbackCtx::new(
+            Arc::new(Mutex::new(ListenerState::new(tx, Some(Arc::clone(&set))))),
+            || true,
+        );
         (ctx, rx, set)
     }
 
@@ -1092,11 +1365,7 @@ mod tests {
 
     fn make_ctx_with_events() -> (CallbackCtx, Receiver<KeyEvent>) {
         let (tx, rx) = mpsc::channel();
-        let ctx = CallbackCtx {
-            state: Arc::new(Mutex::new(ListenerState::new(tx, None))),
-            tap: Cell::new(None),
-            presses: RefCell::new(PressBlocking::default()),
-        };
+        let ctx = CallbackCtx::new(Arc::new(Mutex::new(ListenerState::new(tx, None))), || true);
         (ctx, rx)
     }
 
