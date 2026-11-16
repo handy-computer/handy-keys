@@ -58,12 +58,6 @@ if !check_accessibility() {
 }
 ```
 
-If the permission is revoked while a listener runs, the listener removes its
-event tap (so the Mac keeps responding) and stops. `recv` then returns
-`Error::AccessibilityRevoked`, and `status()` reports it for callers that use
-`try_recv`. Create a new listener or manager once the permission is back;
-creating one fails with `Error::AccessibilityNotGranted` until then.
-
 ### Windows
 
 Uses low-level keyboard hooks. No special permissions required.

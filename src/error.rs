@@ -9,11 +9,6 @@ pub enum Error {
     #[error("Accessibility permission not granted. Please enable it in System Settings > Privacy & Security > Accessibility")]
     AccessibilityNotGranted,
 
-    /// The listener stopped because the accessibility permission was revoked
-    /// while it ran (macOS). Create a new listener once it is granted again.
-    #[error("Accessibility permission was revoked. Keyboard events are no longer received")]
-    AccessibilityRevoked,
-
     #[error("Failed to create event tap: {0}")]
     EventTapCreationFailed(String),
 
