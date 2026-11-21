@@ -388,13 +388,9 @@ unsafe extern "C-unwind" fn event_tap_callback(
                         changed_modifier: None,
                     });
                 } else if let Some(modifier_bit) = changed_modifier {
-                    // Regular modifier key — use keycode to toggle the specific bit.
-                    // Fn is the exception: it has no left/right side and its state
-                    // is in the event flags, so read press/release from them. A
-                    // toggle inverts for good after one missed Fn event, and
-                    // reconcile_modifiers never corrects Fn: the press is then
-                    // reported as a release and the release as a press without
-                    // Fn, so a Fn hotkey stays dead until the listener restarts.
+                    // The flags can't tell left from right, so side-specific
+                    // modifiers toggle their bit. Fn has no sides: read it from
+                    // the flags, so a missed Fn event can't invert it for good.
                     let is_key_down = if modifier_bit == Modifiers::FN {
                         flags_have_fn(flags)
                     } else {
@@ -1185,7 +1181,7 @@ mod tests {
     const KC_FN: u16 = 0x3F;
     const FLAG_FN: u64 = CGEventFlags::MaskSecondaryFn.0;
 
-    /// (is_key_down, modifiers) of the single event a Fn FlagsChanged emits.
+    /// (is_key_down, modifiers) of the event a Fn FlagsChanged emits.
     fn fn_event(ctx: &CallbackCtx, rx: &Receiver<KeyEvent>, flags: u64) -> (bool, Modifiers) {
         let events = deliver(ctx, rx, CGEventType::FlagsChanged, KC_FN, flags, HARDWARE);
         assert_eq!(events.len(), 1);
@@ -1193,23 +1189,20 @@ mod tests {
         (events[0].is_key_down, events[0].modifiers)
     }
 
-    /// A Fn release we never saw (tap disabled, secure input, lock screen)
-    /// must not invert every later Fn press: the press was reported as a
-    /// release and the release as a press with no modifiers, so a Fn hotkey
-    /// stayed dead until the app was restarted.
+    /// A missed Fn release must not invert later presses: reconcile_modifiers
+    /// doesn't cover Fn, so a Fn hotkey stayed dead until restart (#44).
     #[test]
     fn missed_fn_release_does_not_invert_later_presses() {
         let (ctx, rx) = make_ctx_with_events();
         assert_eq!(fn_event(&ctx, &rx, FLAG_FN), (true, Modifiers::FN));
-        // The release is missed. The next press and release are still right.
+        // Release missed.
         assert_eq!(fn_event(&ctx, &rx, FLAG_FN), (true, Modifiers::FN));
         assert_eq!(fn_event(&ctx, &rx, 0), (false, Modifiers::empty()));
         assert_eq!(fn_event(&ctx, &rx, FLAG_FN), (true, Modifiers::FN));
         assert_eq!(fn_event(&ctx, &rx, 0), (false, Modifiers::empty()));
     }
 
-    /// Same for a missed Fn press: the listener's first Fn event is a release
-    /// (it started, or the tap was re-enabled, while Fn was held).
+    /// Same when the first Fn event seen is a release (Fn held at startup).
     #[test]
     fn missed_fn_press_does_not_invert_later_presses() {
         let (ctx, rx) = make_ctx_with_events();
@@ -1218,7 +1211,6 @@ mod tests {
         assert_eq!(fn_event(&ctx, &rx, 0), (false, Modifiers::empty()));
     }
 
-    /// Fn keeps its place next to the other modifiers.
     #[test]
     fn fn_combines_with_a_held_modifier() {
         let (ctx, rx) = make_ctx_with_events();
