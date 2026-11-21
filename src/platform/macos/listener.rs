@@ -388,9 +388,14 @@ unsafe extern "C-unwind" fn event_tap_callback(
                         changed_modifier: None,
                     });
                 } else if let Some(modifier_bit) = changed_modifier {
-                    // Regular modifier key — use keycode to toggle the specific bit
-                    let was_set = state.current_modifiers.contains(modifier_bit);
-                    let is_key_down = !was_set;
+                    // The flags can't tell left from right, so side-specific
+                    // modifiers toggle their bit. Fn has no sides: read it from
+                    // the flags, so a missed Fn event can't invert it for good.
+                    let is_key_down = if modifier_bit == Modifiers::FN {
+                        flags_have_fn(flags)
+                    } else {
+                        !state.current_modifiers.contains(modifier_bit)
+                    };
 
                     if is_key_down {
                         state.current_modifiers |= modifier_bit;
@@ -416,28 +421,6 @@ unsafe extern "C-unwind" fn event_tap_callback(
                         is_key_down,
                         changed_modifier,
                     });
-                } else if keycode == 0x3F {
-                    // FN key itself — tracked via flags, not keycode state
-                    let had_fn = modifiers.contains(Modifiers::FN);
-                    let has_fn = flags_have_fn(flags);
-                    if had_fn != has_fn {
-                        let new_modifiers = if has_fn {
-                            state.current_modifiers | Modifiers::FN
-                        } else {
-                            state.current_modifiers & !Modifiers::FN
-                        };
-
-                        if has_fn {
-                            should_block = state.should_block(new_modifiers, None);
-                        }
-
-                        let _ = state.event_sender.send(KeyEvent {
-                            modifiers: new_modifiers,
-                            key: None,
-                            is_key_down: has_fn,
-                            changed_modifier: Some(Modifiers::FN),
-                        });
-                    }
                 }
             }
             // Mouse button events
@@ -1192,6 +1175,60 @@ mod tests {
         assert_eq!(
             ctx.state.lock().unwrap().current_modifiers,
             Modifiers::CTRL_LEFT
+        );
+    }
+
+    const KC_FN: u16 = 0x3F;
+    const FLAG_FN: u64 = CGEventFlags::MaskSecondaryFn.0;
+
+    /// (is_key_down, modifiers) of the event a Fn FlagsChanged emits.
+    fn fn_event(ctx: &CallbackCtx, rx: &Receiver<KeyEvent>, flags: u64) -> (bool, Modifiers) {
+        let events = deliver(ctx, rx, CGEventType::FlagsChanged, KC_FN, flags, HARDWARE);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].changed_modifier, Some(Modifiers::FN));
+        (events[0].is_key_down, events[0].modifiers)
+    }
+
+    /// A missed Fn release must not invert later presses: reconcile_modifiers
+    /// doesn't cover Fn, so a Fn hotkey stayed dead until restart (#44).
+    #[test]
+    fn missed_fn_release_does_not_invert_later_presses() {
+        let (ctx, rx) = make_ctx_with_events();
+        assert_eq!(fn_event(&ctx, &rx, FLAG_FN), (true, Modifiers::FN));
+        // Release missed.
+        assert_eq!(fn_event(&ctx, &rx, FLAG_FN), (true, Modifiers::FN));
+        assert_eq!(fn_event(&ctx, &rx, 0), (false, Modifiers::empty()));
+        assert_eq!(fn_event(&ctx, &rx, FLAG_FN), (true, Modifiers::FN));
+        assert_eq!(fn_event(&ctx, &rx, 0), (false, Modifiers::empty()));
+    }
+
+    /// Same when the first Fn event seen is a release (Fn held at startup).
+    #[test]
+    fn missed_fn_press_does_not_invert_later_presses() {
+        let (ctx, rx) = make_ctx_with_events();
+        assert_eq!(fn_event(&ctx, &rx, 0), (false, Modifiers::empty()));
+        assert_eq!(fn_event(&ctx, &rx, FLAG_FN), (true, Modifiers::FN));
+        assert_eq!(fn_event(&ctx, &rx, 0), (false, Modifiers::empty()));
+    }
+
+    #[test]
+    fn fn_combines_with_a_held_modifier() {
+        let (ctx, rx) = make_ctx_with_events();
+        deliver(
+            &ctx,
+            &rx,
+            CGEventType::FlagsChanged,
+            KC_RIGHT_CTRL,
+            FLAG_CONTROL,
+            HARDWARE,
+        );
+        assert_eq!(
+            fn_event(&ctx, &rx, FLAG_CONTROL | FLAG_FN),
+            (true, Modifiers::CTRL_RIGHT | Modifiers::FN)
+        );
+        assert_eq!(
+            fn_event(&ctx, &rx, FLAG_CONTROL),
+            (false, Modifiers::CTRL_RIGHT)
         );
     }
 }
